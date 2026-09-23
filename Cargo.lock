@@ -4522,6 +4522,7 @@ dependencies = [
  "futures",
  "lancedb",
  "proptest",
+ "reqwest",
  "serde",
  "serde_arrow",
  "serde_json",
