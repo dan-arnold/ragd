@@ -29,6 +29,12 @@ pub struct Config {
     #[arg(long, env = "EMBED_MODEL")]
     pub embed_model: String,
 
+    /// Dimensionality of the embedding model's output vectors. Fixed at
+    /// table-creation time, so this must match whatever `embed_model`
+    /// actually produces.
+    #[arg(long, env = "EMBED_DIM")]
+    pub embed_dim: usize,
+
     /// OpenAI-compatible chat-completions endpoint.
     #[arg(long, env = "LLM_ENDPOINT")]
     pub llm_endpoint: String,
@@ -56,6 +62,8 @@ mod tests {
             "http://localhost:8080/v1",
             "--embed-model",
             "test-embed",
+            "--embed-dim",
+            "4",
             "--llm-endpoint",
             "http://localhost:8080/v1",
             "--llm-model",

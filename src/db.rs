@@ -34,7 +34,7 @@ pub enum ResourceStatus {
 }
 
 impl ResourceStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",
             Self::Inactive => "inactive",
@@ -84,7 +84,7 @@ pub enum IndexingStatus {
 }
 
 impl IndexingStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Indexing => "indexing",

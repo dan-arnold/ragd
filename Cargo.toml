@@ -7,6 +7,7 @@ edition = "2024"
 arrow-array = "58"
 arrow-schema = "58"
 axum = "0.8.9"
+chrono = { version = "0.4.45", features = ["clock"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
 lancedb = { version = "0.39.0", features = ["remote"] }
