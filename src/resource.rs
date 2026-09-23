@@ -108,16 +108,9 @@ pub async fn index_resource(
             continue;
         }
         let path = entry.into_path();
-        let Some(extension) = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(str::to_string)
-        else {
+        let Some(extension) = indexable_extension(&path) else {
             continue;
         };
-        if is_binary_extension(&extension) {
-            continue;
-        }
 
         let semaphore = Arc::clone(&semaphore);
         let client = Arc::clone(&client);
@@ -152,7 +145,21 @@ pub async fn index_resource(
     outcome
 }
 
-async fn index_one_file(
+/// Extension for `path` if it's a file this daemon indexes, `None` if it
+/// has no extension or is a recognized binary format. Shared by the
+/// initial full scan and the live watcher so they can never silently
+/// diverge on what counts as indexable (unlike the Python original, whose
+/// bulk indexer and file watcher drifted apart this way).
+pub(crate) fn indexable_extension(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?.to_string();
+    if is_binary_extension(&extension) {
+        None
+    } else {
+        Some(extension)
+    }
+}
+
+pub(crate) async fn index_one_file(
     resource_name: &str,
     path: &Path,
     extension: &str,
