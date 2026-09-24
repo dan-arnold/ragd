@@ -26,6 +26,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tower_http::catch_panic::CatchPanicLayer;
 
 use crate::db::{Database, IndexingStatus, ResourceRecord, ResourceStatus};
 use crate::error::RagdError;
@@ -45,12 +46,18 @@ pub struct AppState {
 }
 
 /// Builds the axum [`Router`] for the daemon's HTTP API.
+///
+/// `CatchPanicLayer` turns a panicking handler into a 500 response instead
+/// of the connection being dropped with nothing written -- axum/hyper don't
+/// do this by default; an unhandled panic in a request's task just aborts
+/// that task, and the client sees an empty reply.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/resources", get(list_resources).post(add_resource))
         .route("/resources/{name}", axum::routing::delete(remove_resource))
         .route("/query", axum::routing::post(query))
+        .layer(CatchPanicLayer::new())
         .with_state(state)
 }
 
@@ -384,6 +391,25 @@ mod tests {
         let response = app.oneshot(request).await.expect("request should succeed");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    async fn always_panics() -> StatusCode {
+        panic!("boom")
+    }
+
+    #[tokio::test]
+    async fn panicking_handler_returns_500_instead_of_dropping_the_connection() {
+        let app = Router::new()
+            .route("/panic", get(always_panics))
+            .layer(CatchPanicLayer::new());
+        let request = Request::builder()
+            .uri("/panic")
+            .body(Body::empty())
+            .expect("valid request");
+
+        let response = app.oneshot(request).await.expect("response");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

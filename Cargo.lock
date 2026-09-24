@@ -4661,6 +4661,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
+ "tower-http 0.6.11",
  "tracing",
  "tracing-subscriber",
  "tree-sitter",
@@ -5866,6 +5867,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url",
 ]
 
