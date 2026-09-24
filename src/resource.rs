@@ -254,8 +254,7 @@ pub async fn index_resource(
 /// has no extension, is a recognized binary format, or is a
 /// dependency-manager lockfile. Shared by the initial full scan and the
 /// live watcher so they can never silently diverge on what counts as
-/// indexable (unlike the Python original, whose bulk indexer and file
-/// watcher drifted apart this way).
+/// indexable.
 pub(crate) fn indexable_extension(path: &Path) -> Option<String> {
     let extension = path.extension()?.to_str()?.to_string();
     if is_binary_extension(&extension) {
@@ -357,8 +356,8 @@ pub(crate) async fn index_one_file(
 }
 
 /// Converts a `file://` resource URI to a filesystem path. Remote (http/s)
-/// resource URIs aren't supported -- an intentional scope decision (see the
-/// project plan), not an oversight.
+/// resource URIs aren't supported -- an intentional scope decision, not an
+/// oversight.
 pub fn uri_to_path(uri: &str) -> Result<PathBuf> {
     uri.strip_prefix("file://")
         .map(PathBuf::from)
@@ -380,8 +379,7 @@ fn content_hash(content: &str) -> String {
 
 /// Tracks which resources are actively indexing/watching, so removing a
 /// resource can cancel its in-flight indexing and stop its watcher rather
-/// than leaving them to run against a resource that's gone -- something
-/// neither the Python original nor contextd does (see the project plan).
+/// than leaving them to run against a resource that's gone.
 ///
 /// Holds the shared dependencies needed to start a resource (client, db,
 /// writer, chunking config, watch debounce) so `start` only needs the
@@ -725,8 +723,7 @@ mod tests {
         );
         let version_after_first_run = db.chunks_table_version().await.expect("version");
 
-        // Re-run against the exact same, unchanged file: this is the
-        // regression case for the runaway-reindex bug -- a spurious
+        // Re-run against the exact same, unchanged file: a spurious
         // reconcile (or, here, a plain rerun) on content that hasn't
         // changed must neither call the embedding API again nor write a
         // new (even no-op) table version.

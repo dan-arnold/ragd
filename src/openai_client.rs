@@ -18,14 +18,12 @@
 //! Thin client for OpenAI-compatible embeddings and chat-completions
 //! endpoints. Works against OpenAI itself, a local llama-swap/llama.cpp
 //! server, or anything else speaking the same wire format — there is
-//! deliberately no provider-plugin abstraction (see the project plan for
-//! why).
+//! deliberately no provider-plugin abstraction.
 //!
-//! One correctness detail carried over from diagnosing the Python
-//! original: when no API key is configured (the common case for local
-//! servers), we omit the `Authorization` header entirely rather than
-//! sending `Bearer ` with an empty value, which some HTTP clients reject
-//! client-side in a way that's easy to mistake for a network problem.
+//! When no API key is configured (the common case for local servers), we
+//! omit the `Authorization` header entirely rather than sending `Bearer `
+//! with an empty value, which some HTTP clients reject client-side in a
+//! way that's easy to mistake for a network problem.
 
 use std::time::Duration;
 

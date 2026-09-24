@@ -21,10 +21,8 @@
 //! top-level nodes (functions, classes, impls, ...) are packed into windows
 //! of up to [`ChunkingConfig::chunk_lines`] lines / [`ChunkingConfig::max_chars`]
 //! characters, with [`ChunkingConfig::overlap_lines`] lines of trailing
-//! context carried into the next window — mirroring the tuning the Python
-//! original used (`chunk_lines=80`, `chunk_lines_overlap=15`,
-//! `max_chars=1500`). Everything else falls back to the same
-//! line/char-budget windowing applied directly to the raw text.
+//! context carried into the next window. Everything else falls back to the
+//! same line/char-budget windowing applied directly to the raw text.
 //!
 //! Determinism matters here beyond output quality: the indexing pipeline's
 //! idempotency (see `db.rs`) depends on chunking the same file content
@@ -75,8 +73,7 @@ pub fn chunk_file(extension: &str, content: &str, config: &ChunkingConfig) -> Ve
 }
 
 /// Extensions this daemon never indexes: images, audio/video, archives,
-/// compiled/binary artifacts, fonts, and other non-text formats. Ported
-/// from the Python original's `DEFAULT_BINARY_EXTENSIONS`.
+/// compiled/binary artifacts, fonts, and other non-text formats.
 const BINARY_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tiff", "exr", "hdr", "svg", "psd", "ai",
     "eps", "mp3", "wav", "mp4", "avi", "mov", "webm", "flac", "ogg", "m4a", "aac", "wma", "flv",
