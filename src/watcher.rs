@@ -47,12 +47,19 @@ impl ResourceWatcher {
     /// Starts watching `root` for changes, reconciling every `debounce`
     /// interval. Reconciliation reads and embeds changed files and prunes
     /// chunks for files that no longer exist or are no longer allowed.
+    ///
+    /// `cancellation` is caller-owned rather than created here so it can be
+    /// shared with an in-flight [`crate::resource::index_resource`] call for
+    /// the same resource: cancelling one token stops both the initial scan
+    /// and the ongoing watch in a single call, regardless of which is
+    /// currently running.
     pub fn spawn(
         resource_name: String,
         root: PathBuf,
         client: Arc<OpenAiClient>,
         writer: ChunkWriter,
         config: ChunkingConfig,
+        cancellation: CancellationToken,
         debounce: Duration,
     ) -> Result<Self> {
         let (tx, mut rx) = mpsc::unbounded_channel::<DebounceEventResult>();
@@ -70,7 +77,6 @@ impl ResourceWatcher {
                 RagdError::Storage(format!("failed to watch {}: {err}", root.display()))
             })?;
 
-        let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
 
         tokio::spawn(async move {
@@ -258,6 +264,7 @@ mod tests {
             Arc::clone(&client),
             writer.clone(),
             ChunkingConfig::default(),
+            CancellationToken::new(),
             Duration::from_millis(50),
         )
         .expect("spawn watcher");

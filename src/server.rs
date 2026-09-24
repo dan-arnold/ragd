@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -10,25 +11,28 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::chunker::ChunkingConfig;
 use crate::db::{Database, IndexingStatus, ResourceRecord, ResourceStatus};
 use crate::error::RagdError;
 use crate::openai_client::OpenAiClient;
+use crate::resource::{ChunkWriter, ResourceManager, uri_to_path};
 
 const DEFAULT_TOP_K: usize = 5;
 const MAX_TOP_K: usize = 20;
+const WATCH_DEBOUNCE: Duration = Duration::from_secs(2);
 
+/// Shared dependencies for the HTTP API. Constructed once at startup (see
+/// `main.rs`) and cloned cheaply per-request via axum's `State` extractor.
 #[derive(Clone)]
-struct AppState {
-    db: Arc<Database>,
-    client: Arc<OpenAiClient>,
+pub struct AppState {
+    pub db: Arc<Database>,
+    pub client: Arc<OpenAiClient>,
+    pub writer: ChunkWriter,
+    pub manager: ResourceManager,
 }
 
 /// Builds the axum [`Router`] for the daemon's HTTP API.
-///
-/// `POST /resources` does not yet kick off indexing (that arrives with a
-/// later task wiring the indexing pipeline into resource creation).
-pub fn router(db: Arc<Database>, client: Arc<OpenAiClient>) -> Router {
-    let state = AppState { db, client };
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/resources", get(list_resources).post(add_resource))
@@ -116,6 +120,8 @@ async fn add_resource(
         .into());
     }
 
+    let root = uri_to_path(&request.uri)?;
+
     let resource = ResourceRecord {
         uri: request.uri,
         name: request.name.clone(),
@@ -128,6 +134,18 @@ async fn add_resource(
         last_error: None,
     };
     state.db.upsert_resource(&resource).await?;
+
+    state
+        .manager
+        .start(
+            request.name.clone(),
+            root,
+            Arc::clone(&state.client),
+            state.writer.clone(),
+            ChunkingConfig::default(),
+            WATCH_DEBOUNCE,
+        )
+        .await?;
 
     Ok(Json(StatusMessage {
         status: "ok",
@@ -145,6 +163,7 @@ async fn remove_resource(
 
     resource.status = ResourceStatus::Inactive;
     state.db.upsert_resource(&resource).await?;
+    state.manager.stop(&name).await;
 
     Ok(Json(StatusMessage {
         status: "ok",
@@ -255,6 +274,15 @@ mod tests {
     use axum::routing::post;
     use tower::ServiceExt;
 
+    fn test_app_state(db: Arc<Database>, client: Arc<OpenAiClient>) -> AppState {
+        AppState {
+            writer: ChunkWriter::spawn(Arc::clone(&db)),
+            db,
+            client,
+            manager: ResourceManager::new(),
+        }
+    }
+
     async fn test_router_with_db() -> (Router, Arc<Database>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Arc::new(
@@ -275,7 +303,7 @@ mod tests {
             )
             .expect("client"),
         );
-        (router(Arc::clone(&db), client), db)
+        (router(test_app_state(Arc::clone(&db), client)), db)
     }
 
     async fn test_router() -> Router {
@@ -315,6 +343,16 @@ mod tests {
             .expect("valid request")
     }
 
+    /// `add_resource` starts a real watcher, which needs a real directory to
+    /// watch -- returns the `file://` URI alongside the `TempDir` guard,
+    /// which the caller must keep alive for as long as the resource stays
+    /// registered in the test.
+    fn temp_resource_uri() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = format!("file://{}", dir.path().display());
+        (dir, uri)
+    }
+
     #[tokio::test]
     async fn health_returns_ok() {
         let app = test_router().await;
@@ -330,9 +368,10 @@ mod tests {
     #[tokio::test]
     async fn add_resource_then_list_returns_it() {
         let app = test_router().await;
+        let (_dir, uri) = temp_resource_uri();
         let response = app
             .clone()
-            .oneshot(post_resources("proj", "file:///tmp/proj/"))
+            .oneshot(post_resources("proj", &uri))
             .await
             .expect("post");
         assert_eq!(response.status(), StatusCode::OK);
@@ -353,13 +392,14 @@ mod tests {
     #[tokio::test]
     async fn add_resource_twice_same_uri_is_idempotent() {
         let app = test_router().await;
+        let (_dir, uri) = temp_resource_uri();
         app.clone()
-            .oneshot(post_resources("proj", "file:///tmp/proj/"))
+            .oneshot(post_resources("proj", &uri))
             .await
             .expect("post 1");
         let response = app
             .clone()
-            .oneshot(post_resources("proj", "file:///tmp/proj/"))
+            .oneshot(post_resources("proj", &uri))
             .await
             .expect("post 2");
         assert_eq!(response.status(), StatusCode::OK);
@@ -375,12 +415,14 @@ mod tests {
     #[tokio::test]
     async fn add_resource_duplicate_name_different_uri_conflicts() {
         let app = test_router().await;
+        let (_dir_a, uri_a) = temp_resource_uri();
+        let (_dir_b, uri_b) = temp_resource_uri();
         app.clone()
-            .oneshot(post_resources("proj", "file:///tmp/proj-a/"))
+            .oneshot(post_resources("proj", &uri_a))
             .await
             .expect("post 1");
         let response = app
-            .oneshot(post_resources("proj", "file:///tmp/proj-b/"))
+            .oneshot(post_resources("proj", &uri_b))
             .await
             .expect("post 2");
 
@@ -390,8 +432,9 @@ mod tests {
     #[tokio::test]
     async fn remove_resource_marks_inactive_not_deleted() {
         let app = test_router().await;
+        let (_dir, uri) = temp_resource_uri();
         app.clone()
-            .oneshot(post_resources("proj", "file:///tmp/proj/"))
+            .oneshot(post_resources("proj", &uri))
             .await
             .expect("post");
 
@@ -449,18 +492,20 @@ mod tests {
             OpenAiClient::new(&model_base, "", "test-embed", &model_base, "", "test-llm")
                 .expect("client"),
         );
-        let app = router(Arc::clone(&db), client);
+        let app = router(test_app_state(Arc::clone(&db), client));
 
+        let (_dir, uri) = temp_resource_uri();
         app.clone()
-            .oneshot(post_resources("proj", "file:///tmp/proj/"))
+            .oneshot(post_resources("proj", &uri))
             .await
             .expect("add resource");
+        let file_path = format!("{}/a.rs", uri.strip_prefix("file://").expect("file uri"));
         db.replace_file_chunks(
             "proj",
-            "/tmp/proj/a.rs",
+            &file_path,
             &[ChunkRecord {
                 resource_name: "proj".to_string(),
-                file_path: "/tmp/proj/a.rs".to_string(),
+                file_path: file_path.clone(),
                 chunk_index: 0,
                 content: "fn a() {}".to_string(),
                 content_hash: "hash".to_string(),
@@ -482,7 +527,7 @@ mod tests {
         let json = body_json(response).await;
         assert_eq!(json["answer"], "synthesized answer");
         assert_eq!(json["sources"].as_array().expect("array").len(), 1);
-        assert_eq!(json["sources"][0]["path"], "/tmp/proj/a.rs");
+        assert_eq!(json["sources"][0]["path"], file_path);
         let score = json["sources"][0]["score"].as_f64().expect("score");
         assert!(
             (score - 1.0).abs() < 1e-3,
@@ -504,7 +549,7 @@ mod tests {
                 OpenAiClient::new(&model_base, "", "test-embed", &model_base, "", "test-llm")
                     .expect("client"),
             );
-            (router(Arc::clone(&db), client), db)
+            (router(test_app_state(Arc::clone(&db), client)), db)
         };
 
         let response = app
@@ -528,10 +573,11 @@ mod tests {
             OpenAiClient::new(&model_base, "", "test-embed", &model_base, "", "test-llm")
                 .expect("client"),
         );
-        let app = router(Arc::clone(&db), client);
+        let app = router(test_app_state(Arc::clone(&db), client));
 
+        let (_dir, uri) = temp_resource_uri();
         app.clone()
-            .oneshot(post_resources("proj", "file:///tmp/proj/"))
+            .oneshot(post_resources("proj", &uri))
             .await
             .expect("add resource");
 

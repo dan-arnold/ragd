@@ -1,19 +1,24 @@
-//! Per-resource indexing: walking a directory, chunking and embedding its
-//! files, and writing the results through a single-writer actor so that
-//! concurrent per-file work never races on the storage layer's
-//! `merge_insert` calls (LanceDB's optimistic concurrency control rejects
-//! heavily concurrent writers to one table — see the project plan).
+//! Per-resource indexing and lifecycle management: walking a directory,
+//! chunking and embedding its files, writing the results through a
+//! single-writer actor so that concurrent per-file work never races on the
+//! storage layer's `merge_insert` calls (LanceDB's optimistic concurrency
+//! control rejects heavily concurrent writers to one table), and tracking
+//! which resources are actively indexing/watching so removal can cancel
+//! them promptly.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::chunker::{ChunkingConfig, chunk_file, is_binary_extension};
 use crate::db::{ChunkRecord, Database, ReplaceChunksOutcome};
 use crate::error::{RagdError, Result};
 use crate::openai_client::OpenAiClient;
+use crate::watcher::ResourceWatcher;
 
 struct WriteJob {
     resource_name: String,
@@ -212,6 +217,19 @@ pub(crate) async fn index_one_file(
         .is_ok()
 }
 
+/// Converts a `file://` resource URI to a filesystem path. Remote (http/s)
+/// resource URIs aren't supported -- an intentional scope decision (see the
+/// project plan), not an oversight.
+pub fn uri_to_path(uri: &str) -> Result<PathBuf> {
+    uri.strip_prefix("file://")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            RagdError::Config(format!(
+                "unsupported resource uri (only file:// is supported): {uri}"
+            ))
+        })
+}
+
 /// A cheap, non-cryptographic fingerprint used only for change detection,
 /// not for identity (that's `chunk_key`, in `db.rs`).
 fn content_hash(content: &str) -> String {
@@ -219,6 +237,77 @@ fn content_hash(content: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     content.hash(&mut hasher);
     format!("{:x}", hasher.finish())
+}
+
+/// Tracks which resources are actively indexing/watching, so removing a
+/// resource can cancel its in-flight indexing and stop its watcher rather
+/// than leaving them to run against a resource that's gone -- something
+/// neither the Python original nor contextd does (see the project plan).
+#[derive(Clone, Default)]
+pub struct ResourceManager {
+    active: Arc<Mutex<HashMap<String, ResourceWatcher>>>,
+}
+
+impl ResourceManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Starts indexing and watching `resource_name` at `root`: an initial
+    /// full scan runs in the background, followed by (and sharing a
+    /// cancellation token with) an ongoing watch. If this resource was
+    /// already active, its previous indexing/watching is stopped first.
+    pub async fn start(
+        &self,
+        resource_name: String,
+        root: PathBuf,
+        client: Arc<OpenAiClient>,
+        writer: ChunkWriter,
+        config: ChunkingConfig,
+        debounce: Duration,
+    ) -> Result<()> {
+        self.stop(&resource_name).await;
+
+        let cancellation = CancellationToken::new();
+
+        let index_name = resource_name.clone();
+        let index_root = root.clone();
+        let index_client = Arc::clone(&client);
+        let index_writer = writer.clone();
+        let index_cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            index_resource(
+                &index_name,
+                &index_root,
+                index_client,
+                index_writer,
+                config,
+                index_cancellation,
+                4,
+            )
+            .await;
+        });
+
+        let watcher = ResourceWatcher::spawn(
+            resource_name.clone(),
+            root,
+            client,
+            writer,
+            config,
+            cancellation,
+            debounce,
+        )?;
+        self.active.lock().await.insert(resource_name, watcher);
+        Ok(())
+    }
+
+    /// Cancels indexing and stops watching `resource_name`, if it was
+    /// active. A no-op if it wasn't.
+    pub async fn stop(&self, resource_name: &str) {
+        if let Some(watcher) = self.active.lock().await.remove(resource_name) {
+            watcher.stop();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -456,5 +545,153 @@ mod tests {
             .await
             .expect("query");
         assert_eq!(results.len(), 8);
+    }
+
+    async fn poll_until<F, Fut>(timeout: std::time::Duration, mut check: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let start = tokio::time::Instant::now();
+        loop {
+            if check().await {
+                return true;
+            }
+            if start.elapsed() > timeout {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_manager_start_indexes_and_then_watches() {
+        let project = tempfile::tempdir().expect("tempdir");
+        std::fs::write(project.path().join("a.rs"), "fn a() {}\n").expect("write a.rs");
+
+        let embed_base = mock_embed_server().await;
+        let client = Arc::new(
+            OpenAiClient::new(&embed_base, "", "test-embed", &embed_base, "", "test-llm")
+                .expect("client"),
+        );
+        let db = test_db().await;
+        let writer = ChunkWriter::spawn(Arc::clone(&db));
+        let manager = ResourceManager::new();
+
+        manager
+            .start(
+                "proj".to_string(),
+                project.path().to_path_buf(),
+                Arc::clone(&client),
+                writer,
+                ChunkingConfig::default(),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .expect("start");
+
+        let found_initial = poll_until(std::time::Duration::from_secs(5), || async {
+            db.query_similar("proj", &[1.0; EMBED_DIM], 10)
+                .await
+                .map(|r| !r.is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(found_initial, "initial scan should have indexed a.rs");
+
+        std::fs::write(project.path().join("b.rs"), "fn b() {}\n").expect("write b.rs");
+        let found_live = poll_until(std::time::Duration::from_secs(5), || async {
+            db.query_similar("proj", &[1.0; EMBED_DIM], 10)
+                .await
+                .map(|r| r.len() >= 2)
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(
+            found_live,
+            "watcher should pick up b.rs after the initial scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_manager_stop_cancels_in_flight_scan_and_stops_watching() {
+        let project = tempfile::tempdir().expect("tempdir");
+        for i in 0..10 {
+            std::fs::write(
+                project.path().join(format!("f{i}.rs")),
+                format!("fn f{i}() {{}}\n"),
+            )
+            .expect("write file");
+        }
+
+        // A slow embed endpoint gives cancellation a real window to interrupt
+        // the scan before every file finishes.
+        let app = axum::Router::new().route(
+            "/embeddings",
+            axum::routing::post(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                let embedding = vec![1.0_f32; EMBED_DIM];
+                axum::Json(serde_json::json!({ "data": [{ "embedding": embedding }] }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let embed_base = format!("http://{addr}");
+
+        let client = Arc::new(
+            OpenAiClient::new(&embed_base, "", "test-embed", &embed_base, "", "test-llm")
+                .expect("client"),
+        );
+        let db = test_db().await;
+        let writer = ChunkWriter::spawn(Arc::clone(&db));
+        let manager = ResourceManager::new();
+
+        manager
+            .start(
+                "proj".to_string(),
+                project.path().to_path_buf(),
+                Arc::clone(&client),
+                writer,
+                ChunkingConfig::default(),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .expect("start");
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        manager.stop("proj").await;
+
+        // Give any (incorrectly) still-running work more than enough time to
+        // have finished indexing everything, then confirm it didn't.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let results = db
+            .query_similar("proj", &[1.0; EMBED_DIM], 20)
+            .await
+            .expect("query");
+        assert!(
+            results.len() < 10,
+            "cancellation should have interrupted the scan, but all {} files were indexed",
+            results.len()
+        );
+
+        // And the watcher must be stopped too: new files shouldn't appear.
+        std::fs::write(project.path().join("after-stop.rs"), "fn late() {}\n")
+            .expect("write after-stop.rs");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let results_after = db
+            .query_similar("proj", &[1.0; EMBED_DIM], 20)
+            .await
+            .expect("query");
+        assert!(
+            results_after
+                .iter()
+                .all(|c| !c.file_path.ends_with("after-stop.rs")),
+            "watcher should not still be running after stop()"
+        );
     }
 }
