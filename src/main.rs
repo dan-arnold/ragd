@@ -27,7 +27,13 @@ async fn main() -> ragd::Result<()> {
         &config.llm_model,
     )?);
     let writer = ChunkWriter::spawn(Arc::clone(&db));
-    let manager = ResourceManager::new();
+    let manager = ResourceManager::new(
+        Arc::clone(&client),
+        Arc::clone(&db),
+        writer,
+        ChunkingConfig::default(),
+        WATCH_DEBOUNCE,
+    );
 
     // Resume indexing/watching for resources left active from a previous
     // run -- without this, a daemon restart would silently stop watching
@@ -39,16 +45,7 @@ async fn main() -> ragd::Result<()> {
         .filter(|resource| resource.status == ResourceStatus::Active)
     {
         if let Ok(root) = uri_to_path(&resource.uri) {
-            manager
-                .start(
-                    resource.name,
-                    root,
-                    Arc::clone(&client),
-                    writer.clone(),
-                    ChunkingConfig::default(),
-                    WATCH_DEBOUNCE,
-                )
-                .await?;
+            manager.start(resource.name, root).await?;
         }
     }
 
@@ -56,7 +53,6 @@ async fn main() -> ragd::Result<()> {
     let app = server::router(AppState {
         db,
         client,
-        writer,
         manager,
     });
 

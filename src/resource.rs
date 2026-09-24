@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::chunker::{ChunkingConfig, chunk_file, is_binary_extension};
-use crate::db::{ChunkRecord, Database, ReplaceChunksOutcome};
+use crate::db::{ChunkRecord, Database, IndexingStatus, ReplaceChunksOutcome};
 use crate::error::{RagdError, Result};
 use crate::openai_client::OpenAiClient;
 use crate::watcher::ResourceWatcher;
@@ -243,40 +243,69 @@ fn content_hash(content: &str) -> String {
 /// resource can cancel its in-flight indexing and stop its watcher rather
 /// than leaving them to run against a resource that's gone -- something
 /// neither the Python original nor contextd does (see the project plan).
-#[derive(Clone, Default)]
+///
+/// Holds the shared dependencies needed to start a resource (client, db,
+/// writer, chunking config, watch debounce) so `start` only needs the
+/// per-call specifics (name, root) rather than threading all of them
+/// through every call site.
+#[derive(Clone)]
 pub struct ResourceManager {
     active: Arc<Mutex<HashMap<String, ResourceWatcher>>>,
+    client: Arc<OpenAiClient>,
+    db: Arc<Database>,
+    writer: ChunkWriter,
+    config: ChunkingConfig,
+    debounce: Duration,
 }
 
 impl ResourceManager {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(
+        client: Arc<OpenAiClient>,
+        db: Arc<Database>,
+        writer: ChunkWriter,
+        config: ChunkingConfig,
+        debounce: Duration,
+    ) -> Self {
+        Self {
+            active: Arc::new(Mutex::new(HashMap::new())),
+            client,
+            db,
+            writer,
+            config,
+            debounce,
+        }
     }
 
     /// Starts indexing and watching `resource_name` at `root`: an initial
     /// full scan runs in the background, followed by (and sharing a
     /// cancellation token with) an ongoing watch. If this resource was
     /// already active, its previous indexing/watching is stopped first.
-    pub async fn start(
-        &self,
-        resource_name: String,
-        root: PathBuf,
-        client: Arc<OpenAiClient>,
-        writer: ChunkWriter,
-        config: ChunkingConfig,
-        debounce: Duration,
-    ) -> Result<()> {
+    ///
+    /// The `resources` row for `resource_name` is updated across the
+    /// scan's lifecycle (pending -> indexing -> indexed), so
+    /// `Database::get_resource_by_name` reflects real progress instead of
+    /// staying "pending" forever once a scan actually finishes.
+    pub async fn start(&self, resource_name: String, root: PathBuf) -> Result<()> {
         self.stop(&resource_name).await;
+
+        if let Some(mut resource) = self.db.get_resource_by_name(&resource_name).await? {
+            resource.indexing_status = IndexingStatus::Indexing;
+            resource.indexing_status_message = None;
+            resource.indexing_started_at = Some(chrono::Utc::now().to_rfc3339());
+            self.db.upsert_resource(&resource).await?;
+        }
 
         let cancellation = CancellationToken::new();
 
         let index_name = resource_name.clone();
         let index_root = root.clone();
-        let index_client = Arc::clone(&client);
-        let index_writer = writer.clone();
+        let index_client = Arc::clone(&self.client);
+        let index_writer = self.writer.clone();
         let index_cancellation = cancellation.clone();
+        let index_db = Arc::clone(&self.db);
+        let config = self.config;
         tokio::spawn(async move {
-            index_resource(
+            let outcome = index_resource(
                 &index_name,
                 &index_root,
                 index_client,
@@ -286,16 +315,30 @@ impl ResourceManager {
                 4,
             )
             .await;
+            if let Ok(Some(mut resource)) = index_db.get_resource_by_name(&index_name).await {
+                resource.indexing_status = IndexingStatus::Indexed;
+                resource.indexing_status_message = if outcome.files_failed > 0 {
+                    Some(format!(
+                        "{} of {} files failed to index",
+                        outcome.files_failed,
+                        outcome.files_indexed + outcome.files_failed
+                    ))
+                } else {
+                    None
+                };
+                resource.last_indexed_at = Some(chrono::Utc::now().to_rfc3339());
+                let _ = index_db.upsert_resource(&resource).await;
+            }
         });
 
         let watcher = ResourceWatcher::spawn(
             resource_name.clone(),
             root,
-            client,
-            writer,
-            config,
+            Arc::clone(&self.client),
+            self.writer.clone(),
+            self.config,
             cancellation,
-            debounce,
+            self.debounce,
         )?;
         self.active.lock().await.insert(resource_name, watcher);
         Ok(())
@@ -576,17 +619,16 @@ mod tests {
         );
         let db = test_db().await;
         let writer = ChunkWriter::spawn(Arc::clone(&db));
-        let manager = ResourceManager::new();
+        let manager = ResourceManager::new(
+            Arc::clone(&client),
+            Arc::clone(&db),
+            writer,
+            ChunkingConfig::default(),
+            std::time::Duration::from_millis(50),
+        );
 
         manager
-            .start(
-                "proj".to_string(),
-                project.path().to_path_buf(),
-                Arc::clone(&client),
-                writer,
-                ChunkingConfig::default(),
-                std::time::Duration::from_millis(50),
-            )
+            .start("proj".to_string(), project.path().to_path_buf())
             .await
             .expect("start");
 
@@ -611,6 +653,70 @@ mod tests {
             found_live,
             "watcher should pick up b.rs after the initial scan"
         );
+    }
+
+    #[tokio::test]
+    async fn resource_manager_start_updates_indexing_status_through_lifecycle() {
+        use crate::db::{IndexingStatus, ResourceRecord, ResourceStatus};
+
+        let project = tempfile::tempdir().expect("tempdir");
+        std::fs::write(project.path().join("a.rs"), "fn a() {}\n").expect("write a.rs");
+
+        let embed_base = mock_embed_server().await;
+        let client = Arc::new(
+            OpenAiClient::new(&embed_base, "", "test-embed", &embed_base, "", "test-llm")
+                .expect("client"),
+        );
+        let db = test_db().await;
+        let writer = ChunkWriter::spawn(Arc::clone(&db));
+        let manager = ResourceManager::new(
+            Arc::clone(&client),
+            Arc::clone(&db),
+            writer,
+            ChunkingConfig::default(),
+            std::time::Duration::from_millis(50),
+        );
+
+        db.upsert_resource(&ResourceRecord {
+            uri: format!("file://{}", project.path().display()),
+            name: "proj".to_string(),
+            status: ResourceStatus::Active,
+            indexing_status: IndexingStatus::Pending,
+            indexing_status_message: None,
+            created_at: "2026-09-24T00:00:00Z".to_string(),
+            indexing_started_at: None,
+            last_indexed_at: None,
+            last_error: None,
+        })
+        .await
+        .expect("seed resource");
+
+        manager
+            .start("proj".to_string(), project.path().to_path_buf())
+            .await
+            .expect("start");
+
+        let indexed = poll_until(std::time::Duration::from_secs(5), || async {
+            db.get_resource_by_name("proj")
+                .await
+                .map(|r| {
+                    r.map(|r| r.indexing_status == IndexingStatus::Indexed)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        })
+        .await;
+
+        assert!(
+            indexed,
+            "indexing_status should reach Indexed once the scan completes, not stay Pending forever"
+        );
+        let resource = db
+            .get_resource_by_name("proj")
+            .await
+            .expect("query")
+            .expect("present");
+        assert!(resource.last_indexed_at.is_some());
     }
 
     #[tokio::test]
@@ -649,17 +755,16 @@ mod tests {
         );
         let db = test_db().await;
         let writer = ChunkWriter::spawn(Arc::clone(&db));
-        let manager = ResourceManager::new();
+        let manager = ResourceManager::new(
+            Arc::clone(&client),
+            Arc::clone(&db),
+            writer,
+            ChunkingConfig::default(),
+            std::time::Duration::from_millis(50),
+        );
 
         manager
-            .start(
-                "proj".to_string(),
-                project.path().to_path_buf(),
-                Arc::clone(&client),
-                writer,
-                ChunkingConfig::default(),
-                std::time::Duration::from_millis(50),
-            )
+            .start("proj".to_string(), project.path().to_path_buf())
             .await
             .expect("start");
 

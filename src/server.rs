@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -11,15 +10,13 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::chunker::ChunkingConfig;
 use crate::db::{Database, IndexingStatus, ResourceRecord, ResourceStatus};
 use crate::error::RagdError;
 use crate::openai_client::OpenAiClient;
-use crate::resource::{ChunkWriter, ResourceManager, uri_to_path};
+use crate::resource::{ResourceManager, uri_to_path};
 
 const DEFAULT_TOP_K: usize = 5;
 const MAX_TOP_K: usize = 20;
-const WATCH_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Shared dependencies for the HTTP API. Constructed once at startup (see
 /// `main.rs`) and cloned cheaply per-request via axum's `State` extractor.
@@ -27,7 +24,6 @@ const WATCH_DEBOUNCE: Duration = Duration::from_secs(2);
 pub struct AppState {
     pub db: Arc<Database>,
     pub client: Arc<OpenAiClient>,
-    pub writer: ChunkWriter,
     pub manager: ResourceManager,
 }
 
@@ -135,17 +131,7 @@ async fn add_resource(
     };
     state.db.upsert_resource(&resource).await?;
 
-    state
-        .manager
-        .start(
-            request.name.clone(),
-            root,
-            Arc::clone(&state.client),
-            state.writer.clone(),
-            ChunkingConfig::default(),
-            WATCH_DEBOUNCE,
-        )
-        .await?;
+    state.manager.start(request.name.clone(), root).await?;
 
     Ok(Json(StatusMessage {
         status: "ok",
@@ -268,18 +254,28 @@ async fn query(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::chunker::ChunkingConfig;
     use crate::db::ChunkRecord;
+    use crate::resource::ChunkWriter;
     use axum::body::Body;
     use axum::http::Request;
     use axum::routing::post;
+    use std::time::Duration;
     use tower::ServiceExt;
 
     fn test_app_state(db: Arc<Database>, client: Arc<OpenAiClient>) -> AppState {
+        let writer = ChunkWriter::spawn(Arc::clone(&db));
+        let manager = ResourceManager::new(
+            Arc::clone(&client),
+            Arc::clone(&db),
+            writer,
+            ChunkingConfig::default(),
+            Duration::from_millis(50),
+        );
         AppState {
-            writer: ChunkWriter::spawn(Arc::clone(&db)),
             db,
             client,
-            manager: ResourceManager::new(),
+            manager,
         }
     }
 

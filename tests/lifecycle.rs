@@ -90,11 +90,16 @@ async fn full_lifecycle_add_index_query_remove() {
             .expect("client"),
     );
     let writer = ChunkWriter::spawn(Arc::clone(&db));
-    let manager = ResourceManager::new();
+    let manager = ResourceManager::new(
+        Arc::clone(&client),
+        Arc::clone(&db),
+        writer,
+        ChunkingConfig::default(),
+        std::time::Duration::from_secs(2),
+    );
     let app = server::router(AppState {
         db: Arc::clone(&db),
         client,
-        writer,
         manager,
     });
 
