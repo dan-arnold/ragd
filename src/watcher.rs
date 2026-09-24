@@ -18,22 +18,18 @@
 //! Live filesystem watching for a resource: debounced change notifications
 //! are reconciled against current disk state (does the path still exist,
 //! is it still allowed by `.gitignore`) rather than trusting the
-//! underlying watcher's event kind, which `notify-debouncer-mini`
-//! deliberately doesn't distinguish beyond "something changed here" vs.
+//! underlying watcher's event kind. `notify-debouncer-mini` deliberately
+//! doesn't distinguish event kinds beyond "something changed here" vs.
 //! "continuous writes here" — there's no separate delete/rename event to
-//! hook, which is exactly the gap that let the Python original's watcher
-//! silently skip deletions. Reconciling against ground truth on every
-//! event sidesteps needing that distinction at all: a path that no longer
-//! exists gets its chunks pruned, one that exists and is still allowed
-//! gets re-indexed.
+//! hook. Reconciling against ground truth on every event sidesteps
+//! needing that distinction at all: a path that no longer exists gets its
+//! chunks pruned, one that exists and is still allowed gets re-indexed.
 //!
 //! Ignore-checking is nested-`.gitignore`-aware, rebuilt from every
-//! `.gitignore` under the resource root on each reconciliation. This is a
-//! deliberate correctness-over-micro-optimization choice: contextd (the
-//! Rust project surveyed while planning this daemon) has the same bug the
-//! Python original did here, checking new files against only the
-//! resource-root's own `.gitignore` at watch time even though its initial
-//! scan handles nested ones correctly.
+//! `.gitignore` under the resource root on each reconciliation — a
+//! deliberate correctness-over-micro-optimization choice, since matching
+//! only against the resource-root's own `.gitignore` would miss nested
+//! `.gitignore` files entirely.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -144,24 +140,27 @@ async fn reconcile(
         }
 
         let is_dir = path.is_dir();
-        // Checked before the gitignore match: a directory, or a path whose
-        // extension was never indexable in the first place (most of
-        // what's under a large ignored directory like `target/` -- object
-        // files, fingerprints, timestamps), could never have had chunks.
-        // Skipping those outright, rather than falling through to the
-        // prune branch below, matters a lot in practice: a single build
-        // can generate thousands of these events, and every one used to
-        // cost a LanceDB write.
-        let Some(extension) = (!is_dir).then(|| indexable_extension(&path)).flatten() else {
-            continue;
-        };
-
         let allowed = path.starts_with(root)
             && !ignore_matcher
                 .matched_path_or_any_parents(&path, is_dir)
                 .is_ignore();
+        // Checked before the extension check: a path outside root or
+        // gitignored could never have been indexed, no matter what its
+        // extension looks like -- and plenty of what's under a large
+        // ignored directory like `target/` (dep-info, fingerprint JSON,
+        // ...) has an extension that isn't on the binary/lockfile
+        // skip-lists and would otherwise look indexable.
+        if !allowed {
+            continue;
+        }
 
-        if allowed && path.is_file() {
+        let Some(extension) = (!is_dir).then(|| indexable_extension(&path)).flatten() else {
+            // Allowed but never indexable (a directory, a binary
+            // extension, or a lockfile): also never had chunks.
+            continue;
+        };
+
+        if path.is_file() {
             index_one_file(
                 resource_name,
                 &path,
@@ -173,8 +172,8 @@ async fn reconcile(
             )
             .await;
         } else {
-            // Deleted, renamed away, or now ignored: prune whatever
-            // chunks it had. Passing an empty chunk set deletes
+            // Deleted or renamed away since the event fired: prune
+            // whatever chunks it had. Passing an empty chunk set deletes
             // everything currently recorded for this exact path in one
             // transaction.
             let _ = writer
@@ -417,17 +416,25 @@ mod tests {
             .await
             .expect("version before");
 
-        // A single reconciled build produces many of these: non-indexable
-        // extensions (or none at all) inside a directory `.gitignore`
-        // excludes. This is the regression case for the runaway-reindex
-        // bug -- every one of these events used to cost a real LanceDB
-        // write even though the path could never have been indexed.
+        // A single `cargo build` produces many of these under a real
+        // target/: object files with a binary extension, but also
+        // fingerprint/dep-info files whose extension (`.json`, here)
+        // isn't on any binary or lockfile list and would otherwise look
+        // perfectly indexable. Only the gitignore check catches those.
         for i in 0..30 {
             std::fs::write(
                 setup.project.path().join(format!("target/artifact{i}.o")),
                 "binary junk",
             )
             .expect("write artifact");
+            std::fs::write(
+                setup
+                    .project
+                    .path()
+                    .join(format!("target/fingerprint{i}.json")),
+                "{\"not\": \"source code\"}",
+            )
+            .expect("write fingerprint");
         }
         std::fs::create_dir_all(setup.project.path().join("target/nested")).expect("mkdir nested");
 

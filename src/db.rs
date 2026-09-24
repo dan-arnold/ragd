@@ -21,9 +21,7 @@
 //! upsert-and-prune: [`Database::replace_file_chunks`] replaces *exactly*
 //! one file's chunk set in a single `merge_insert` transaction, so
 //! re-indexing unchanged content is a no-op and a file whose chunk
-//! boundaries shift never leaves orphaned rows behind. This directly
-//! targets the duplicate/orphaned-vector bug this daemon replaces (see
-//! the project plan for the empirical root-cause analysis).
+//! boundaries shift never leaves orphaned rows behind.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -227,8 +225,15 @@ pub struct ReplaceChunksOutcome {
 }
 
 /// Handle to the daemon's LanceDB-backed storage.
+///
+/// `resources_table` and `chunks_table` are resolved once, in
+/// [`Self::connect`], and held for the life of this handle: `lancedb::Table`
+/// is a cheap `Clone` (an `Arc<dyn BaseTable>` internally), so every
+/// operation can just clone the field instead of paying for a fresh
+/// `table_names()` listing plus `open_table()` round trip.
 pub struct Database {
-    connection: lancedb::Connection,
+    resources_table: lancedb::Table,
+    chunks_table: lancedb::Table,
     embed_dim: usize,
 }
 
@@ -241,13 +246,17 @@ impl Database {
         tokio::fs::create_dir_all(data_dir).await?;
         let uri = data_dir.to_string_lossy().into_owned();
         let connection = lancedb::connect(&uri).execute().await?;
-        let db = Self {
-            connection,
+        let resources_table =
+            Self::open_or_create_table(&connection, RESOURCES_TABLE, Self::resources_schema())
+                .await?;
+        let chunks_table =
+            Self::open_or_create_table(&connection, CHUNKS_TABLE, Self::chunks_schema(embed_dim))
+                .await?;
+        Ok(Self {
+            resources_table,
+            chunks_table,
             embed_dim,
-        };
-        db.ensure_resources_table().await?;
-        db.ensure_chunks_table().await?;
-        Ok(db)
+        })
     }
 
     fn resources_schema() -> Arc<Schema> {
@@ -264,7 +273,7 @@ impl Database {
         ]))
     }
 
-    fn chunks_schema(&self) -> Arc<Schema> {
+    fn chunks_schema(embed_dim: usize) -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("chunk_key", DataType::Utf8, false),
             Field::new("resource_name", DataType::Utf8, false),
@@ -278,7 +287,7 @@ impl Database {
                 "embedding",
                 DataType::FixedSizeList(
                     Arc::new(Field::new("item", DataType::Float32, true)),
-                    self.embed_dim as i32,
+                    embed_dim as i32,
                 ),
                 false,
             ),
@@ -286,34 +295,29 @@ impl Database {
         ]))
     }
 
-    async fn ensure_resources_table(&self) -> Result<lancedb::Table> {
-        let names = self.connection.table_names().execute().await?;
-        if names.iter().any(|n| n == RESOURCES_TABLE) {
-            return Ok(self
-                .connection
-                .open_table(RESOURCES_TABLE)
-                .execute()
-                .await?);
+    /// Opens `table_name` if it already exists, creating it (empty, with
+    /// `schema`) otherwise.
+    async fn open_or_create_table(
+        connection: &lancedb::Connection,
+        table_name: &str,
+        schema: Arc<Schema>,
+    ) -> Result<lancedb::Table> {
+        let names = connection.table_names().execute().await?;
+        if names.iter().any(|n| n == table_name) {
+            return Ok(connection.open_table(table_name).execute().await?);
         }
-        let schema = Self::resources_schema();
-        Ok(self
-            .connection
-            .create_empty_table(RESOURCES_TABLE, schema)
+        Ok(connection
+            .create_empty_table(table_name, schema)
             .execute()
             .await?)
     }
 
+    async fn ensure_resources_table(&self) -> Result<lancedb::Table> {
+        Ok(self.resources_table.clone())
+    }
+
     async fn ensure_chunks_table(&self) -> Result<lancedb::Table> {
-        let names = self.connection.table_names().execute().await?;
-        if names.iter().any(|n| n == CHUNKS_TABLE) {
-            return Ok(self.connection.open_table(CHUNKS_TABLE).execute().await?);
-        }
-        let schema = self.chunks_schema();
-        Ok(self
-            .connection
-            .create_empty_table(CHUNKS_TABLE, schema)
-            .execute()
-            .await?)
+        Ok(self.chunks_table.clone())
     }
 
     /// Inserts or updates a resource, keyed on its URI.
@@ -634,7 +638,10 @@ impl Database {
             Arc::new(updated_at_b.finish()),
         ];
 
-        Ok(RecordBatch::try_new(self.chunks_schema(), columns)?)
+        Ok(RecordBatch::try_new(
+            Self::chunks_schema(self.embed_dim),
+            columns,
+        )?)
     }
 }
 
@@ -918,8 +925,7 @@ mod tests {
         assert_eq!(first.written, 2);
         assert_eq!(first.deleted, 0);
 
-        // Re-applying the exact same chunk set must not grow the table —
-        // this is the core regression test for the duplication bug.
+        // Re-applying the exact same chunk set must not grow the table.
         let second = db
             .replace_file_chunks("proj", "/tmp/proj/a.rs", &chunks)
             .await
