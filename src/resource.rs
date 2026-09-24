@@ -31,7 +31,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::chunker::{ChunkingConfig, chunk_file, is_binary_extension};
+use crate::chunker::{ChunkingConfig, chunk_file, is_binary_extension, is_lockfile_name};
 use crate::db::{ChunkFingerprint, ChunkRecord, Database, IndexingStatus, ReplaceChunksOutcome};
 use crate::error::{RagdError, Result};
 use crate::openai_client::OpenAiClient;
@@ -251,17 +251,24 @@ pub async fn index_resource(
 }
 
 /// Extension for `path` if it's a file this daemon indexes, `None` if it
-/// has no extension or is a recognized binary format. Shared by the
-/// initial full scan and the live watcher so they can never silently
-/// diverge on what counts as indexable (unlike the Python original, whose
-/// bulk indexer and file watcher drifted apart this way).
+/// has no extension, is a recognized binary format, or is a
+/// dependency-manager lockfile. Shared by the initial full scan and the
+/// live watcher so they can never silently diverge on what counts as
+/// indexable (unlike the Python original, whose bulk indexer and file
+/// watcher drifted apart this way).
 pub(crate) fn indexable_extension(path: &Path) -> Option<String> {
     let extension = path.extension()?.to_str()?.to_string();
     if is_binary_extension(&extension) {
-        None
-    } else {
-        Some(extension)
+        return None;
     }
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_lockfile_name)
+    {
+        return None;
+    }
+    Some(extension)
 }
 
 pub(crate) async fn index_one_file(
@@ -551,11 +558,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_resource_indexes_matching_files_and_skips_binaries() {
+    async fn index_resource_indexes_matching_files_and_skips_binaries_and_lockfiles() {
         let project = tempfile::tempdir().expect("tempdir");
         std::fs::write(project.path().join("a.rs"), "fn a() {}\n").expect("write a.rs");
         std::fs::write(project.path().join("b.md"), "# hello\n").expect("write b.md");
         std::fs::write(project.path().join("logo.png"), [0u8, 1, 2, 3]).expect("write logo.png");
+        // A lockfile: valid (often huge) text with a non-binary extension,
+        // but machine-generated and not worth indexing -- must be skipped
+        // by exact filename, not just left to the extension check.
+        std::fs::write(
+            project.path().join("Cargo.lock"),
+            "[[package]]\nname = \"a\"\n",
+        )
+        .expect("write Cargo.lock");
 
         let embed_base = mock_embed_server().await;
         let client = Arc::new(
