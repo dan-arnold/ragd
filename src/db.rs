@@ -35,7 +35,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
-use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{RagdError, Result};
@@ -179,6 +179,19 @@ impl ChunkRecord {
     fn chunk_key(&self) -> String {
         chunk_key(&self.resource_name, &self.file_path, self.chunk_index)
     }
+}
+
+/// Just enough of a [`ChunkRecord`] to decide whether a freshly chunked
+/// piece of content is identical to what's already stored, and to reuse
+/// its embedding if so: `content`, `start_line`, `end_line`, and
+/// `updated_at` get recomputed from the current chunking pass regardless,
+/// and `resource_name`/`file_path` are the caller's lookup key already --
+/// none of that is worth carrying across the wire or holding in a cache
+/// just to answer "did this change".
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkFingerprint {
+    pub content_hash: String,
+    pub embedding: Vec<f32>,
 }
 
 /// NUL-byte separated so that resource names or file paths containing `:`
@@ -419,6 +432,54 @@ impl Database {
         })
     }
 
+    /// Returns `(chunk_index, fingerprint)` for every chunk currently
+    /// stored for `file_path` within `resource_name` -- used to check
+    /// `content_hash` against freshly chunked content before paying for a
+    /// re-embed of content that hasn't actually changed. Projects down to
+    /// just `chunk_index`, `content_hash`, and `embedding`: `content` in
+    /// particular can be as large as (or larger than) the embedding
+    /// vector, and there's no reason to pull it off disk for a hash
+    /// comparison the caller's about to throw it away after.
+    ///
+    /// `only_if` with no index is a scan of every chunk this daemon has
+    /// stored, across every resource, not just this one -- LanceDB has no
+    /// notion of a per-table "cheap filter" without a scalar index, and a
+    /// scalar index here would need periodic `optimize()` calls to cover
+    /// new writes (indices aren't updated automatically; unindexed rows
+    /// still get a flat scan) for a benefit LanceDB's own docs say doesn't
+    /// start to matter until ~100K+ rows. Accepting the full scan is the
+    /// right call at the scale this daemon actually runs at (one process
+    /// tracking a handful of project-sized resources), not because the
+    /// scan is somehow cheaper than it looks.
+    pub async fn get_file_chunk_fingerprints(
+        &self,
+        resource_name: &str,
+        file_path: &str,
+    ) -> Result<Vec<(i32, ChunkFingerprint)>> {
+        let table = self.ensure_chunks_table().await?;
+        let filter = format!(
+            "resource_name = {} AND file_path = {}",
+            sql_quote(resource_name),
+            sql_quote(file_path)
+        );
+        let batches: Vec<RecordBatch> = table
+            .query()
+            .only_if(filter)
+            .select(Select::columns(&[
+                "chunk_index",
+                "content_hash",
+                "embedding",
+            ]))
+            .execute()
+            .await?
+            .try_collect()
+            .await?;
+        Ok(batches
+            .iter()
+            .flat_map(chunk_fingerprints_from_batch)
+            .collect())
+    }
+
     /// Removes every chunk belonging to a resource (used when a resource is
     /// removed entirely, not just when one file within it changes).
     pub async fn delete_resource_chunks(&self, resource_name: &str) -> Result<()> {
@@ -427,6 +488,16 @@ impl Database {
             .delete(&format!("resource_name = {}", sql_quote(resource_name)))
             .await?;
         Ok(())
+    }
+
+    /// Current version number of the chunks table. Test-only: lets tests
+    /// assert that a write was actually skipped (e.g. unchanged content,
+    /// or a reconciled path that was never indexable) rather than merely
+    /// having no visible effect -- a no-op `merge_insert` still commits a
+    /// new table version, which `query_similar`-style assertions can't see.
+    #[cfg(test)]
+    pub(crate) async fn chunks_table_version(&self) -> Result<u64> {
+        Ok(self.ensure_chunks_table().await?.version().await?)
     }
 
     /// Returns the `top_k` chunks within `resource_name` nearest to
@@ -693,6 +764,43 @@ fn chunk_records_from_batch(batch: &RecordBatch) -> Vec<Result<ChunkRecord>> {
         .collect()
 }
 
+/// Decodes a batch produced by the `chunk_index, content_hash, embedding`
+/// projection in [`Database::get_file_chunk_fingerprints`]. Panics on a
+/// malformed `embedding` column for the same reason
+/// [`chunk_records_from_batch`] does: it would mean the schema and the
+/// query projection have drifted apart, which is a bug, not bad input.
+fn chunk_fingerprints_from_batch(batch: &RecordBatch) -> Vec<(i32, ChunkFingerprint)> {
+    let chunk_index = downcast_i32(column(batch, "chunk_index"));
+    let content_hash = downcast_string(column(batch, "content_hash"));
+    let embedding_col = column(batch, "embedding");
+    let Some(embedding_col) = embedding_col
+        .as_any()
+        .downcast_ref::<arrow_array::FixedSizeListArray>()
+    else {
+        panic!("`embedding` column is not a FixedSizeListArray (schema bug)");
+    };
+
+    (0..batch.num_rows())
+        .map(|row| {
+            let Some(values) = embedding_col
+                .value(row)
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .map(|a| a.values().to_vec())
+            else {
+                panic!("embedding list element is not a Float32Array (schema bug)");
+            };
+            (
+                chunk_index.value(row),
+                ChunkFingerprint {
+                    content_hash: content_hash.value(row).to_string(),
+                    embedding: values,
+                },
+            )
+        })
+        .collect()
+}
+
 fn downcast_string(array: &ArrayRef) -> &StringArray {
     let Some(array) = array.as_any().downcast_ref::<StringArray>() else {
         panic!("expected a Utf8 column (schema bug)");
@@ -888,6 +996,46 @@ mod tests {
             .expect("query");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file_path, "/tmp/proj/b.rs");
+    }
+
+    #[tokio::test]
+    async fn get_file_chunk_fingerprints_returns_hash_and_embedding_scoped_to_one_file() {
+        let db = test_db().await;
+        let a0 = sample_chunk("proj", "/tmp/proj/a.rs", 0, "fn a() {}");
+        let a1 = sample_chunk("proj", "/tmp/proj/a.rs", 1, "fn b() {}");
+        db.replace_file_chunks("proj", "/tmp/proj/a.rs", &[a0.clone(), a1.clone()])
+            .await
+            .expect("replace a");
+        // A different file, and a different resource sharing the exact
+        // same file path, must not leak into the lookup.
+        db.replace_file_chunks(
+            "proj",
+            "/tmp/proj/b.rs",
+            &[sample_chunk("proj", "/tmp/proj/b.rs", 0, "fn c() {}")],
+        )
+        .await
+        .expect("replace b");
+        db.replace_file_chunks(
+            "other",
+            "/tmp/proj/a.rs",
+            &[sample_chunk("other", "/tmp/proj/a.rs", 0, "fn z() {}")],
+        )
+        .await
+        .expect("replace other resource");
+
+        let mut fingerprints = db
+            .get_file_chunk_fingerprints("proj", "/tmp/proj/a.rs")
+            .await
+            .expect("fingerprints");
+        fingerprints.sort_by_key(|(index, _)| *index);
+
+        assert_eq!(fingerprints.len(), 2);
+        assert_eq!(fingerprints[0].0, 0);
+        assert_eq!(fingerprints[0].1.content_hash, a0.content_hash);
+        assert_eq!(fingerprints[0].1.embedding, a0.embedding);
+        assert_eq!(fingerprints[1].0, 1);
+        assert_eq!(fingerprints[1].1.content_hash, a1.content_hash);
+        assert_eq!(fingerprints[1].1.embedding, a1.embedding);
     }
 
     #[tokio::test]

@@ -144,38 +144,42 @@ async fn reconcile(
         }
 
         let is_dir = path.is_dir();
+        // Checked before the gitignore match: a directory, or a path whose
+        // extension was never indexable in the first place (most of
+        // what's under a large ignored directory like `target/` -- object
+        // files, fingerprints, timestamps), could never have had chunks.
+        // Skipping those outright, rather than falling through to the
+        // prune branch below, matters a lot in practice: a single build
+        // can generate thousands of these events, and every one used to
+        // cost a LanceDB write.
+        let Some(extension) = (!is_dir).then(|| indexable_extension(&path)).flatten() else {
+            continue;
+        };
+
         let allowed = path.starts_with(root)
             && !ignore_matcher
                 .matched_path_or_any_parents(&path, is_dir)
                 .is_ignore();
-        let extension = if allowed && !is_dir {
-            indexable_extension(&path)
-        } else {
-            None
-        };
 
-        match extension {
-            Some(extension) if path.is_file() => {
-                index_one_file(
-                    resource_name,
-                    &path,
-                    &extension,
-                    client,
-                    writer,
-                    config,
-                    cancellation,
-                )
+        if allowed && path.is_file() {
+            index_one_file(
+                resource_name,
+                &path,
+                &extension,
+                client,
+                writer,
+                config,
+                cancellation,
+            )
+            .await;
+        } else {
+            // Deleted, renamed away, or now ignored: prune whatever
+            // chunks it had. Passing an empty chunk set deletes
+            // everything currently recorded for this exact path in one
+            // transaction.
+            let _ = writer
+                .replace_file_chunks(resource_name, &path.to_string_lossy(), Vec::new())
                 .await;
-            }
-            _ => {
-                // Deleted, renamed away, now ignored, or no longer a
-                // recognized extension: prune whatever chunks it had.
-                // Passing an empty chunk set deletes everything currently
-                // recorded for this exact path in one transaction.
-                let _ = writer
-                    .replace_file_chunks(resource_name, &path.to_string_lossy(), Vec::new())
-                    .await;
-            }
         }
     }
 }
@@ -392,6 +396,58 @@ mod tests {
                 .all(|chunk| !chunk.file_path.ends_with("ignored.rs")),
             "ignored.rs must not be indexed: {results:?}"
         );
+
+        setup.watcher.stop();
+    }
+
+    #[tokio::test]
+    async fn watcher_ignored_directory_churn_never_touches_the_chunks_table() {
+        let setup = setup().await;
+        std::fs::write(setup.project.path().join(".gitignore"), "/target\n")
+            .expect("write gitignore");
+        std::fs::create_dir_all(setup.project.path().join("target")).expect("mkdir target");
+
+        // Let the watcher observe the .gitignore before the churn starts,
+        // matching watcher_ignores_new_files_matching_nested_gitignore's
+        // approach.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let version_before = setup
+            .db
+            .chunks_table_version()
+            .await
+            .expect("version before");
+
+        // A single reconciled build produces many of these: non-indexable
+        // extensions (or none at all) inside a directory `.gitignore`
+        // excludes. This is the regression case for the runaway-reindex
+        // bug -- every one of these events used to cost a real LanceDB
+        // write even though the path could never have been indexed.
+        for i in 0..30 {
+            std::fs::write(
+                setup.project.path().join(format!("target/artifact{i}.o")),
+                "binary junk",
+            )
+            .expect("write artifact");
+        }
+        std::fs::create_dir_all(setup.project.path().join("target/nested")).expect("mkdir nested");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            setup
+                .db
+                .chunks_table_version()
+                .await
+                .expect("version after"),
+            version_before,
+            "ignored directory churn must never write to the chunks table"
+        );
+        let results = setup
+            .db
+            .query_similar("proj", &[1.0; EMBED_DIM], 10)
+            .await
+            .expect("query");
+        assert!(results.is_empty());
 
         setup.watcher.stop();
     }

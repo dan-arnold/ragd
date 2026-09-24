@@ -32,7 +32,7 @@ use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::chunker::{ChunkingConfig, chunk_file, is_binary_extension};
-use crate::db::{ChunkRecord, Database, IndexingStatus, ReplaceChunksOutcome};
+use crate::db::{ChunkFingerprint, ChunkRecord, Database, IndexingStatus, ReplaceChunksOutcome};
 use crate::error::{RagdError, Result};
 use crate::openai_client::OpenAiClient;
 use crate::watcher::ResourceWatcher;
@@ -44,27 +44,110 @@ struct WriteJob {
     respond_to: oneshot::Sender<Result<ReplaceChunksOutcome>>,
 }
 
+/// Keys a [`ChunkWriter`]'s in-memory fingerprint cache: one file, scoped
+/// to the resource that owns it (the same file path can't collide across
+/// resources, since chunk identity is already `resource_name` + `file_path`
+/// + `chunk_index` everywhere else in this module).
+type FileKey = (String, String);
+
 /// Serializes all [`Database::replace_file_chunks`] calls through a single
 /// background task, regardless of how many files are being processed
-/// concurrently.
+/// concurrently. Also write-through caches each file's chunk fingerprints
+/// in memory, so a file already touched this run doesn't need a DB round
+/// trip just to check whether its content actually changed.
 #[derive(Clone)]
 pub struct ChunkWriter {
     tx: mpsc::Sender<WriteJob>,
+    // Reads don't need to go through the single-writer actor below --
+    // only `replace_file_chunks` needs serializing, since that's what
+    // races on LanceDB's optimistic concurrency control.
+    db: Arc<Database>,
+    // Populated by the background task below on every successful write,
+    // so it can never observe a chunk set the DB doesn't also have.
+    cache: Arc<Mutex<HashMap<FileKey, HashMap<i32, ChunkFingerprint>>>>,
 }
 
 impl ChunkWriter {
     pub fn spawn(db: Arc<Database>) -> Self {
         let (tx, mut rx) = mpsc::channel::<WriteJob>(256);
+        let writer_db = Arc::clone(&db);
+        let cache: Arc<Mutex<HashMap<FileKey, HashMap<i32, ChunkFingerprint>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let writer_cache = Arc::clone(&cache);
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
-                let result = db
+                let result = writer_db
                     .replace_file_chunks(&job.resource_name, &job.file_path, &job.chunks)
                     .await;
+                if result.is_ok() {
+                    let key = (job.resource_name.clone(), job.file_path.clone());
+                    if job.chunks.is_empty() {
+                        // An empty write is a prune (file deleted, renamed
+                        // away, or newly ignored): drop the cache entry
+                        // rather than caching "zero chunks", so a later
+                        // recreation of the same path starts from a clean
+                        // slate instead of an empty-but-present entry.
+                        writer_cache.lock().await.remove(&key);
+                    } else {
+                        let fingerprints = job
+                            .chunks
+                            .iter()
+                            .map(|chunk| {
+                                (
+                                    chunk.chunk_index,
+                                    ChunkFingerprint {
+                                        content_hash: chunk.content_hash.clone(),
+                                        embedding: chunk.embedding.clone(),
+                                    },
+                                )
+                            })
+                            .collect();
+                        writer_cache.lock().await.insert(key, fingerprints);
+                    }
+                }
                 // The caller may have stopped waiting (e.g. cancelled); nothing to do if so.
                 let _ = job.respond_to.send(result);
             }
         });
-        Self { tx }
+        Self { tx, db, cache }
+    }
+
+    /// Existing chunk fingerprints for one file, keyed by `chunk_index` --
+    /// used to skip re-embedding content whose `content_hash` hasn't
+    /// changed. Served from the in-memory cache when this file has already
+    /// been written this run; falls back to (and populates the cache
+    /// from) the database otherwise.
+    pub async fn get_file_chunk_fingerprints(
+        &self,
+        resource_name: &str,
+        file_path: &str,
+    ) -> Result<HashMap<i32, ChunkFingerprint>> {
+        let key = (resource_name.to_string(), file_path.to_string());
+        if let Some(cached) = self.cache.lock().await.get(&key) {
+            return Ok(cached.clone());
+        }
+
+        let fetched: HashMap<i32, ChunkFingerprint> = self
+            .db
+            .get_file_chunk_fingerprints(resource_name, file_path)
+            .await?
+            .into_iter()
+            .collect();
+        self.cache.lock().await.insert(key, fetched.clone());
+        Ok(fetched)
+    }
+
+    /// Deletes every chunk belonging to `resource_name` and evicts any
+    /// cached fingerprints for it. Without the eviction, a resource
+    /// removed and later re-added under the same name could see stale
+    /// cached embeddings survive from content that no longer exists.
+    pub async fn delete_resource_chunks(&self, resource_name: &str) -> Result<()> {
+        self.db.delete_resource_chunks(resource_name).await?;
+        self.cache
+            .lock()
+            .await
+            .retain(|(cached_resource, _), _| cached_resource != resource_name);
+        Ok(())
     }
 
     pub async fn replace_file_chunks(
@@ -198,24 +281,42 @@ pub(crate) async fn index_one_file(
         return false;
     };
 
+    let file_path = path.to_string_lossy().into_owned();
+    // Keyed by chunk_index so an unchanged chunk can reuse its existing
+    // embedding instead of paying for a re-embed of identical content --
+    // this is the check a watcher false-positive (or any other spurious
+    // reconcile) should hit before it ever reaches the embedding API.
+    let existing = writer
+        .get_file_chunk_fingerprints(resource_name, &file_path)
+        .await
+        .unwrap_or_default();
+
     let mut chunk_records = Vec::new();
     for (index, chunk) in chunk_file(extension, &content, config)
         .into_iter()
         .enumerate()
     {
-        let embedding = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return false,
-            result = client.embed(&chunk.content) => match result {
-                Ok(embedding) => embedding,
-                Err(_) => return false,
-            },
+        let chunk_index = i32::try_from(index).unwrap_or(i32::MAX);
+        let hash = content_hash(&chunk.content);
+        let previous = existing.get(&chunk_index);
+
+        let embedding = if let Some(previous) = previous.filter(|p| p.content_hash == hash) {
+            previous.embedding.clone()
+        } else {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return false,
+                result = client.embed(&chunk.content) => match result {
+                    Ok(embedding) => embedding,
+                    Err(_) => return false,
+                },
+            }
         };
         chunk_records.push(ChunkRecord {
             resource_name: resource_name.to_string(),
-            file_path: path.to_string_lossy().into_owned(),
-            chunk_index: i32::try_from(index).unwrap_or(i32::MAX),
-            content_hash: content_hash(&chunk.content),
+            file_path: file_path.clone(),
+            chunk_index,
+            content_hash: hash,
             content: chunk.content,
             start_line: chunk.start_line as i32,
             end_line: chunk.end_line as i32,
@@ -228,8 +329,22 @@ pub(crate) async fn index_one_file(
         return false;
     }
 
+    // Nothing actually changed (same chunk count, same hash at every
+    // index): skip the write too, not just the embedding, so a spurious
+    // fs event -- or an editor touching a file without changing its
+    // content -- doesn't even cost a LanceDB transaction.
+    let unchanged = chunk_records.len() == existing.len()
+        && chunk_records.iter().all(|record| {
+            existing
+                .get(&record.chunk_index)
+                .is_some_and(|previous| previous.content_hash == record.content_hash)
+        });
+    if unchanged {
+        return true;
+    }
+
     writer
-        .replace_file_chunks(resource_name, &path.to_string_lossy(), chunk_records)
+        .replace_file_chunks(resource_name, &file_path, chunk_records)
         .await
         .is_ok()
 }
@@ -397,6 +512,35 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Like [`mock_embed_server`], but also returns a shared counter
+    /// incremented on every `/embeddings` request -- used to assert that
+    /// unchanged content never reaches the embedding API at all, not just
+    /// that the final chunk count looks right (which a wasted re-embed
+    /// would also satisfy).
+    async fn counting_mock_embed_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let route_count = Arc::clone(&count);
+        let app = Router::new().route(
+            "/embeddings",
+            post(move || {
+                let count = Arc::clone(&route_count);
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let embedding = vec![1.0_f32; EMBED_DIM];
+                    Json(serde_json::json!({ "data": [{ "embedding": embedding }] }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (format!("http://{addr}"), count)
+    }
+
     async fn test_db() -> Arc<Database> {
         let dir = tempfile::tempdir().expect("tempdir");
         Arc::new(
@@ -537,6 +681,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn index_resource_rerun_on_unchanged_files_skips_reembedding_and_writing() {
+        let project = tempfile::tempdir().expect("tempdir");
+        std::fs::write(project.path().join("a.rs"), "fn a() {}\nfn b() {}\n").expect("write a.rs");
+
+        let (embed_base, embed_calls) = counting_mock_embed_server().await;
+        let client = Arc::new(
+            OpenAiClient::new(&embed_base, "", "test-embed", &embed_base, "", "test-llm")
+                .expect("client"),
+        );
+        let db = test_db().await;
+        let writer = ChunkWriter::spawn(Arc::clone(&db));
+
+        index_resource(
+            "proj",
+            project.path(),
+            Arc::clone(&client),
+            writer.clone(),
+            ChunkingConfig::default(),
+            CancellationToken::new(),
+            4,
+        )
+        .await;
+        let calls_after_first_run = embed_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            calls_after_first_run > 0,
+            "the first run must embed something"
+        );
+        let version_after_first_run = db.chunks_table_version().await.expect("version");
+
+        // Re-run against the exact same, unchanged file: this is the
+        // regression case for the runaway-reindex bug -- a spurious
+        // reconcile (or, here, a plain rerun) on content that hasn't
+        // changed must neither call the embedding API again nor write a
+        // new (even no-op) table version.
+        index_resource(
+            "proj",
+            project.path(),
+            client,
+            writer,
+            ChunkingConfig::default(),
+            CancellationToken::new(),
+            4,
+        )
+        .await;
+
+        assert_eq!(
+            embed_calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_after_first_run,
+            "re-indexing unchanged content must not call the embedding API again"
+        );
+        assert_eq!(
+            db.chunks_table_version().await.expect("version"),
+            version_after_first_run,
+            "re-indexing unchanged content must not write a new table version"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_one_file_reembeds_only_the_chunk_that_changed() {
+        let project = tempfile::tempdir().expect("tempdir");
+        // Plain text (not a recognized code extension) chunks by a simple,
+        // predictable line/char budget rather than tree-sitter's
+        // function-boundary heuristics: chunk_lines=2, overlap=0 on 4
+        // lines deterministically yields chunk 0 = lines [0,1], chunk 1 =
+        // lines [2,3].
+        let path = project.path().join("a.txt");
+        std::fs::write(&path, "line0\nline1\nline2\nline3").expect("write a.txt");
+
+        let (embed_base, embed_calls) = counting_mock_embed_server().await;
+        let client = Arc::new(
+            OpenAiClient::new(&embed_base, "", "test-embed", &embed_base, "", "test-llm")
+                .expect("client"),
+        );
+        let db = test_db().await;
+        let writer = ChunkWriter::spawn(Arc::clone(&db));
+        let config = ChunkingConfig {
+            chunk_lines: 2,
+            overlap_lines: 0,
+            max_chars: 1000,
+        };
+        let cancellation = CancellationToken::new();
+
+        let extension = "txt";
+        index_one_file(
+            "proj",
+            &path,
+            extension,
+            &client,
+            &writer,
+            &config,
+            &cancellation,
+        )
+        .await;
+        let fingerprints_before = db
+            .get_file_chunk_fingerprints("proj", &path.to_string_lossy())
+            .await
+            .expect("fingerprints");
+        assert_eq!(fingerprints_before.len(), 2, "expected two chunks");
+        let calls_after_first_index = embed_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(calls_after_first_index, 2);
+
+        // Change only the last line, which lives in chunk 1; chunk 0's
+        // lines are byte-identical.
+        std::fs::write(&path, "line0\nline1\nline2\nline3-changed").expect("rewrite a.txt");
+        index_one_file(
+            "proj",
+            &path,
+            extension,
+            &client,
+            &writer,
+            &config,
+            &cancellation,
+        )
+        .await;
+
+        assert_eq!(
+            embed_calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_after_first_index + 1,
+            "only the changed chunk should have been re-embedded"
+        );
+
+        let fingerprints_after = db
+            .get_file_chunk_fingerprints("proj", &path.to_string_lossy())
+            .await
+            .expect("fingerprints");
+        let before_chunk_0 = fingerprints_before
+            .iter()
+            .find(|(index, _)| *index == 0)
+            .map(|(_, fp)| fp)
+            .expect("chunk 0 present before");
+        let after_chunk_0 = fingerprints_after
+            .iter()
+            .find(|(index, _)| *index == 0)
+            .map(|(_, fp)| fp)
+            .expect("chunk 0 present after");
+        assert_eq!(
+            before_chunk_0, after_chunk_0,
+            "the unchanged first chunk's fingerprint (hash and embedding) must survive untouched"
+        );
+    }
+
+    #[tokio::test]
     async fn index_resource_cancelled_before_start_indexes_nothing() {
         let project = tempfile::tempdir().expect("tempdir");
         std::fs::write(project.path().join("a.rs"), "fn a() {}\n").expect("write a.rs");
@@ -605,6 +891,92 @@ mod tests {
             .await
             .expect("query");
         assert_eq!(results.len(), 8);
+    }
+
+    fn sample_record(resource_name: &str, file_path: &str) -> ChunkRecord {
+        ChunkRecord {
+            resource_name: resource_name.to_string(),
+            file_path: file_path.to_string(),
+            chunk_index: 0,
+            content: "fn a() {}".to_string(),
+            content_hash: "hash".to_string(),
+            start_line: 0,
+            end_line: 0,
+            embedding: vec![1.0; EMBED_DIM],
+            updated_at: "2026-09-24T00:00:00Z".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn chunk_writer_populates_cache_on_write_and_evicts_on_prune() {
+        let db = test_db().await;
+        let writer = ChunkWriter::spawn(Arc::clone(&db));
+        let key = ("proj".to_string(), "/tmp/proj/a.rs".to_string());
+
+        writer
+            .replace_file_chunks(
+                "proj",
+                "/tmp/proj/a.rs",
+                vec![sample_record("proj", "/tmp/proj/a.rs")],
+            )
+            .await
+            .expect("write");
+        assert!(
+            writer.cache.lock().await.contains_key(&key),
+            "a successful write must populate the cache"
+        );
+
+        // An empty write is a prune (deleted / renamed away / newly
+        // ignored): the cache entry must go with it, not linger as an
+        // empty-but-present entry that could shadow a later recreation of
+        // the same path.
+        writer
+            .replace_file_chunks("proj", "/tmp/proj/a.rs", Vec::new())
+            .await
+            .expect("prune");
+        assert!(
+            !writer.cache.lock().await.contains_key(&key),
+            "a prune (empty write) must evict the cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_writer_delete_resource_chunks_evicts_matching_cache_entries_only() {
+        let db = test_db().await;
+        let writer = ChunkWriter::spawn(Arc::clone(&db));
+
+        writer
+            .replace_file_chunks(
+                "proj",
+                "/tmp/proj/a.rs",
+                vec![sample_record("proj", "/tmp/proj/a.rs")],
+            )
+            .await
+            .expect("write proj");
+        writer
+            .replace_file_chunks(
+                "other",
+                "/tmp/proj/a.rs",
+                vec![sample_record("other", "/tmp/proj/a.rs")],
+            )
+            .await
+            .expect("write other");
+
+        writer
+            .delete_resource_chunks("proj")
+            .await
+            .expect("delete proj");
+
+        let cache = writer.cache.lock().await;
+        assert!(
+            !cache.contains_key(&("proj".to_string(), "/tmp/proj/a.rs".to_string())),
+            "deleting a resource must evict its cached fingerprints"
+        );
+        assert!(
+            cache.contains_key(&("other".to_string(), "/tmp/proj/a.rs".to_string())),
+            "deleting one resource must not evict another resource's cache entries, \
+             even for the exact same file path"
+        );
     }
 
     async fn poll_until<F, Fut>(timeout: std::time::Duration, mut check: F) -> bool
