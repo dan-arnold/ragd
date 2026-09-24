@@ -226,14 +226,17 @@ pub struct ReplaceChunksOutcome {
 
 /// Handle to the daemon's LanceDB-backed storage.
 ///
-/// `resources_table` and `chunks_table` are resolved once, in
-/// [`Self::connect`], and held for the life of this handle: `lancedb::Table`
-/// is a cheap `Clone` (an `Arc<dyn BaseTable>` internally), so every
-/// operation can just clone the field instead of paying for a fresh
-/// `table_names()` listing plus `open_table()` round trip.
+/// Each operation re-resolves its table via [`Self::ensure_resources_table`]
+/// / [`Self::ensure_chunks_table`] rather than holding a long-lived
+/// `lancedb::Table` handle. A `Table` carries a `DatasetConsistencyWrapper`
+/// with an `Arc<Mutex<DatasetState>>` shared across every clone; LanceDB's
+/// own test suite (`dataset.rs`: `test_get_returns_error_on_poisoned_lock`
+/// et al.) treats a poisoned lock on that shared state as an expected
+/// condition a long-lived handle can reach. A fresh handle per call means
+/// one bad operation can't leave every later request on this connection
+/// permanently wedged.
 pub struct Database {
-    resources_table: lancedb::Table,
-    chunks_table: lancedb::Table,
+    connection: lancedb::Connection,
     embed_dim: usize,
 }
 
@@ -246,17 +249,13 @@ impl Database {
         tokio::fs::create_dir_all(data_dir).await?;
         let uri = data_dir.to_string_lossy().into_owned();
         let connection = lancedb::connect(&uri).execute().await?;
-        let resources_table =
-            Self::open_or_create_table(&connection, RESOURCES_TABLE, Self::resources_schema())
-                .await?;
-        let chunks_table =
-            Self::open_or_create_table(&connection, CHUNKS_TABLE, Self::chunks_schema(embed_dim))
-                .await?;
-        Ok(Self {
-            resources_table,
-            chunks_table,
+        let db = Self {
+            connection,
             embed_dim,
-        })
+        };
+        db.ensure_resources_table().await?;
+        db.ensure_chunks_table().await?;
+        Ok(db)
     }
 
     fn resources_schema() -> Arc<Schema> {
@@ -313,11 +312,17 @@ impl Database {
     }
 
     async fn ensure_resources_table(&self) -> Result<lancedb::Table> {
-        Ok(self.resources_table.clone())
+        Self::open_or_create_table(&self.connection, RESOURCES_TABLE, Self::resources_schema())
+            .await
     }
 
     async fn ensure_chunks_table(&self) -> Result<lancedb::Table> {
-        Ok(self.chunks_table.clone())
+        Self::open_or_create_table(
+            &self.connection,
+            CHUNKS_TABLE,
+            Self::chunks_schema(self.embed_dim),
+        )
+        .await
     }
 
     /// Inserts or updates a resource, keyed on its URI.
