@@ -200,7 +200,7 @@ mod tests {
         let app = Router::new().route(
             "/embeddings",
             post(|| async {
-                let embedding = vec![0.0_f32; EMBED_DIM];
+                let embedding = vec![1.0_f32; EMBED_DIM];
                 Json(serde_json::json!({ "data": [{ "embedding": embedding }] }))
             }),
         );
@@ -277,7 +277,7 @@ mod tests {
         let found = poll_until(Duration::from_secs(5), || async {
             setup
                 .db
-                .query_similar("proj", &[0.0; EMBED_DIM], 10)
+                .query_similar("proj", &[1.0; EMBED_DIM], 10)
                 .await
                 .map(|r| !r.is_empty())
                 .unwrap_or(false)
@@ -297,7 +297,7 @@ mod tests {
         poll_until(Duration::from_secs(5), || async {
             setup
                 .db
-                .query_similar("proj", &[0.0; EMBED_DIM], 10)
+                .query_similar("proj", &[1.0; EMBED_DIM], 10)
                 .await
                 .map(|r| !r.is_empty())
                 .unwrap_or(false)
@@ -309,7 +309,7 @@ mod tests {
         let pruned = poll_until(Duration::from_secs(5), || async {
             setup
                 .db
-                .query_similar("proj", &[0.0; EMBED_DIM], 10)
+                .query_similar("proj", &[1.0; EMBED_DIM], 10)
                 .await
                 .map(|r| r.is_empty())
                 .unwrap_or(false)
@@ -347,7 +347,7 @@ mod tests {
         let found_kept = poll_until(Duration::from_secs(5), || async {
             setup
                 .db
-                .query_similar("proj", &[0.0; EMBED_DIM], 10)
+                .query_similar("proj", &[1.0; EMBED_DIM], 10)
                 .await
                 .map(|r| !r.is_empty())
                 .unwrap_or(false)
@@ -359,7 +359,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let results = setup
             .db
-            .query_similar("proj", &[0.0; EMBED_DIM], 10)
+            .query_similar("proj", &[1.0; EMBED_DIM], 10)
             .await
             .expect("query");
         assert!(
@@ -382,7 +382,7 @@ mod tests {
 
         let results = setup
             .db
-            .query_similar("proj", &[0.0; EMBED_DIM], 10)
+            .query_similar("proj", &[1.0; EMBED_DIM], 10)
             .await
             .expect("query");
         assert!(

@@ -234,7 +234,7 @@ mod tests {
         let app = Router::new().route(
             "/embeddings",
             post(|| async {
-                let embedding = vec![0.0_f32; EMBED_DIM];
+                let embedding = vec![1.0_f32; EMBED_DIM];
                 Json(serde_json::json!({ "data": [{ "embedding": embedding }] }))
             }),
         );
@@ -287,7 +287,7 @@ mod tests {
         assert_eq!(outcome.files_failed, 0);
 
         let results = db
-            .query_similar("proj", &[0.0; EMBED_DIM], 10)
+            .query_similar("proj", &[1.0; EMBED_DIM], 10)
             .await
             .expect("query");
         assert_eq!(results.len(), 2);
@@ -331,7 +331,7 @@ mod tests {
         );
 
         let results = db
-            .query_similar("proj", &[0.0; EMBED_DIM], 10)
+            .query_similar("proj", &[1.0; EMBED_DIM], 10)
             .await
             .expect("query");
         assert_eq!(results.len(), 1);
@@ -362,7 +362,7 @@ mod tests {
         )
         .await;
         let first_count = db
-            .query_similar("proj", &[0.0; EMBED_DIM], 100)
+            .query_similar("proj", &[1.0; EMBED_DIM], 100)
             .await
             .expect("query")
             .len();
@@ -379,7 +379,7 @@ mod tests {
         )
         .await;
         let second_count = db
-            .query_similar("proj", &[0.0; EMBED_DIM], 100)
+            .query_similar("proj", &[1.0; EMBED_DIM], 100)
             .await
             .expect("query")
             .len();
@@ -415,7 +415,7 @@ mod tests {
         .await;
 
         let results = db
-            .query_similar("proj", &[0.0; EMBED_DIM], 10)
+            .query_similar("proj", &[1.0; EMBED_DIM], 10)
             .await
             .expect("query");
         assert!(results.is_empty());
@@ -438,7 +438,7 @@ mod tests {
                     content_hash: "hash".to_string(),
                     start_line: 0,
                     end_line: 0,
-                    embedding: vec![0.0; EMBED_DIM],
+                    embedding: vec![1.0; EMBED_DIM],
                     updated_at: "2026-09-24T00:00:00Z".to_string(),
                 };
                 writer
@@ -452,7 +452,7 @@ mod tests {
         }
 
         let results = db
-            .query_similar("proj", &[0.0; EMBED_DIM], 100)
+            .query_similar("proj", &[1.0; EMBED_DIM], 100)
             .await
             .expect("query");
         assert_eq!(results.len(), 8);

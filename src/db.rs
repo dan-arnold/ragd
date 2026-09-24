@@ -426,6 +426,52 @@ impl Database {
         query_embedding: &[f32],
         top_k: usize,
     ) -> Result<Vec<ChunkRecord>> {
+        let batches = self
+            .query_similar_batches(resource_name, query_embedding, top_k)
+            .await?;
+        batches.iter().flat_map(chunk_records_from_batch).collect()
+    }
+
+    /// Like [`Self::query_similar`], but pairs each chunk with a
+    /// `0.0..=1.0` similarity score (`1.0` = identical direction, under
+    /// cosine similarity), highest first. Used for the `/query` endpoint,
+    /// which needs to expose relevance to the caller; `query_similar`
+    /// doesn't, so it's kept score-free rather than have every caller
+    /// discard a value they don't need.
+    ///
+    /// # Panics
+    ///
+    /// Same precondition as [`Self::query_similar`].
+    pub async fn query_similar_with_scores(
+        &self,
+        resource_name: &str,
+        query_embedding: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<(ChunkRecord, f32)>> {
+        let batches = self
+            .query_similar_batches(resource_name, query_embedding, top_k)
+            .await?;
+
+        let mut results = Vec::new();
+        for batch in &batches {
+            let distances = downcast_f32(column(batch, "_distance"));
+            for (row, chunk_result) in chunk_records_from_batch(batch).into_iter().enumerate() {
+                // LanceDB's cosine "_distance" is 1 - cosine_similarity (see
+                // lance_linalg::distance::cosine, verified against the exact
+                // version we depend on); invert it back to a similarity score
+                // so callers see "higher is more relevant".
+                results.push((chunk_result?, 1.0 - distances.value(row)));
+            }
+        }
+        Ok(results)
+    }
+
+    async fn query_similar_batches(
+        &self,
+        resource_name: &str,
+        query_embedding: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<RecordBatch>> {
         assert_eq!(
             query_embedding.len(),
             self.embed_dim,
@@ -435,17 +481,16 @@ impl Database {
         );
 
         let table = self.ensure_chunks_table().await?;
-        let batches: Vec<RecordBatch> = table
+        Ok(table
             .query()
             .only_if(format!("resource_name = {}", sql_quote(resource_name)))
             .nearest_to(query_embedding)?
+            .distance_type(lancedb::DistanceType::Cosine)
             .limit(top_k)
             .execute()
             .await?
             .try_collect()
-            .await?;
-
-        batches.iter().flat_map(chunk_records_from_batch).collect()
+            .await?)
     }
 
     fn chunks_to_record_batch(&self, chunks: &[ChunkRecord]) -> Result<RecordBatch> {
@@ -645,6 +690,13 @@ fn downcast_i32(array: &ArrayRef) -> &Int32Array {
     array
 }
 
+fn downcast_f32(array: &ArrayRef) -> &arrow_array::Float32Array {
+    let Some(array) = array.as_any().downcast_ref::<arrow_array::Float32Array>() else {
+        panic!("expected a Float32 column (schema bug)");
+    };
+    array
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -689,7 +741,10 @@ mod tests {
             content_hash: format!("hash-{content}"),
             start_line: chunk_index * 10,
             end_line: chunk_index * 10 + 9,
-            embedding: vec![chunk_index as f32; EMBED_DIM],
+            // +1 so chunk_index 0 never produces a degenerate all-zero
+            // vector, which cosine similarity (used by query_similar) can't
+            // meaningfully compare against anything.
+            embedding: vec![(chunk_index + 1) as f32; EMBED_DIM],
             updated_at: "2026-09-24T00:00:00Z".to_string(),
         }
     }
@@ -747,7 +802,7 @@ mod tests {
         assert_eq!(second.deleted, 0);
 
         let results = db
-            .query_similar("proj", &[0.0; EMBED_DIM], 10)
+            .query_similar("proj", &[1.0; EMBED_DIM], 10)
             .await
             .expect("query");
         assert_eq!(results.len(), 2);
@@ -779,7 +834,7 @@ mod tests {
         assert_eq!(outcome.deleted, 2);
 
         let results = db
-            .query_similar("proj", &[0.0; EMBED_DIM], 10)
+            .query_similar("proj", &[1.0; EMBED_DIM], 10)
             .await
             .expect("query");
         assert_eq!(results.len(), 1);
@@ -811,11 +866,46 @@ mod tests {
             .expect("empty replace");
 
         let results = db
-            .query_similar("proj", &[0.0; EMBED_DIM], 10)
+            .query_similar("proj", &[1.0; EMBED_DIM], 10)
             .await
             .expect("query");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file_path, "/tmp/proj/b.rs");
+    }
+
+    #[tokio::test]
+    async fn query_similar_with_scores_ranks_by_cosine_similarity() {
+        let db = test_db().await;
+        let mut aligned = sample_chunk("proj", "/tmp/proj/a.rs", 0, "aligned");
+        aligned.embedding = vec![1.0, 0.0, 0.0, 0.0];
+        let mut orthogonal = sample_chunk("proj", "/tmp/proj/b.rs", 0, "orthogonal");
+        orthogonal.embedding = vec![0.0, 1.0, 0.0, 0.0];
+
+        db.replace_file_chunks("proj", "/tmp/proj/a.rs", &[aligned])
+            .await
+            .expect("replace a");
+        db.replace_file_chunks("proj", "/tmp/proj/b.rs", &[orthogonal])
+            .await
+            .expect("replace b");
+
+        let results = db
+            .query_similar_with_scores("proj", &[1.0, 0.0, 0.0, 0.0], 10)
+            .await
+            .expect("query");
+
+        assert_eq!(results.len(), 2);
+        let (nearest, nearest_score) = &results[0];
+        assert_eq!(nearest.content, "aligned");
+        assert!(
+            (*nearest_score - 1.0).abs() < 1e-4,
+            "identical vectors should score ~1.0, got {nearest_score}"
+        );
+
+        let (_, farthest_score) = &results[1];
+        assert!(
+            farthest_score.abs() < 1e-4,
+            "orthogonal vectors should score ~0.0, got {farthest_score}"
+        );
     }
 
     #[tokio::test]
@@ -849,7 +939,7 @@ mod tests {
 
                 prop_assert_eq!(second.deleted, 0);
 
-                let results = db.query_similar("proj", &[0.0; EMBED_DIM], contents.len() + 1).await.expect("query");
+                let results = db.query_similar("proj", &[1.0; EMBED_DIM], contents.len() + 1).await.expect("query");
                 prop_assert_eq!(results.len(), chunks.len());
                 Ok(())
             })?;
