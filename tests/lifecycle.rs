@@ -1,3 +1,20 @@
+// Copyright (C) 2026  Daniel Arnold
+//
+// This file is part of ragd.
+//
+// ragd is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// ragd is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with ragd.  If not, see <https://www.gnu.org/licenses/>.
+
 //! Integration tests against `ragd`'s public API: the full HTTP
 //! add→index→query→remove lifecycle, and the idempotency-across-a-restart
 //! regression test that this whole rewrite exists to fix (see the project
