@@ -225,11 +225,16 @@ async fn query(
     State(state): State<AppState>,
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
+    tracing::info!(resource = %request.resource, query = %request.query, "RAG query received");
+
     let resource = state
         .db
         .get_resource_by_name(&request.resource)
         .await?
-        .ok_or_else(|| RagdError::ResourceNotFound(request.resource.clone()))?;
+        .ok_or_else(|| {
+            tracing::warn!(resource = %request.resource, "RAG query for unknown resource");
+            RagdError::ResourceNotFound(request.resource.clone())
+        })?;
 
     let top_k = request.top_k.unwrap_or(DEFAULT_TOP_K).clamp(1, MAX_TOP_K);
     let query_embedding = state.client.embed(&request.query).await?;
@@ -239,6 +244,7 @@ async fn query(
         .await?;
 
     if scored_chunks.is_empty() {
+        tracing::info!(resource = %request.resource, "RAG query matched no indexed content");
         return Ok(Json(QueryResponse {
             answer: "No indexed content matched this query.".to_string(),
             sources: Vec::new(),
@@ -255,7 +261,7 @@ async fn query(
     );
     let answer = state.client.chat(&system_prompt, &request.query).await?;
 
-    let sources = scored_chunks
+    let sources: Vec<SourceChunk> = scored_chunks
         .into_iter()
         .map(|(chunk, score)| SourceChunk {
             path: chunk.file_path,
@@ -263,6 +269,8 @@ async fn query(
             score,
         })
         .collect();
+
+    tracing::info!(resource = %request.resource, sources = sources.len(), "RAG query answered");
 
     Ok(Json(QueryResponse { answer, sources }))
 }

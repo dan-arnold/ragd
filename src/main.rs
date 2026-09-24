@@ -32,6 +32,15 @@ const WATCH_DEBOUNCE: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> ragd::Result<()> {
+    // Defaults to "info" (so `/query` request logging is visible out of
+    // the box) but honors RUST_LOG if set, same as any other tracing-based
+    // Rust binary.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
     println!(
         "ragd {}  Copyright (C) 2026  Daniel Arnold\n\
          This program comes with ABSOLUTELY NO WARRANTY.\n\
