@@ -1,0 +1,9 @@
+# Patterns here are ANDed against git-secrets matches: a flagged line that
+# also matches one of these is treated as a false positive, not a leak.
+# See scripts/setup-git-secrets.sh for how prohibited patterns are installed.
+
+# Placeholders in docs/examples, not real values.
+[Cc]hange[Mm]e
+CHANGEME
+secretvalue
+[Ee]xample
