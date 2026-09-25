@@ -75,7 +75,7 @@ impl IntoResponse for ApiError {
         let status = match &self.0 {
             RagdError::ResourceNotFound(_) => StatusCode::NOT_FOUND,
             RagdError::ResourceAlreadyExists(_) => StatusCode::CONFLICT,
-            RagdError::Config(_) => StatusCode::BAD_REQUEST,
+            RagdError::Config(_) | RagdError::NotAGitRepository(_) => StatusCode::BAD_REQUEST,
             RagdError::Io(_) | RagdError::Storage(_) | RagdError::ModelEndpoint(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -141,6 +141,20 @@ async fn add_resource(
     }
 
     let root = uri_to_path(&request.uri)?;
+
+    // A bare directory has no natural boundary -- pointing a resource at
+    // one (e.g. a whole home directory) walks and watches everything
+    // underneath it, including caches, SDKs, and anything else that
+    // happens to live there. Requiring a `.git` at the root limits a
+    // resource to what its owner already scoped as "one project" -- and
+    // `.gitignore` then does the rest of the filtering during indexing.
+    if !root.join(".git").exists() {
+        return Err(RagdError::NotAGitRepository(format!(
+            "{} has no .git -- ragd only indexes git repository roots",
+            root.display()
+        ))
+        .into());
+    }
 
     let resource = ResourceRecord {
         uri: request.uri,
@@ -374,9 +388,11 @@ mod tests {
     /// `add_resource` starts a real watcher, which needs a real directory to
     /// watch -- returns the `file://` URI alongside the `TempDir` guard,
     /// which the caller must keep alive for as long as the resource stays
-    /// registered in the test.
+    /// registered in the test. Includes a `.git` marker since `add_resource`
+    /// now requires one.
     fn temp_resource_uri() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join(".git")).expect("mkdir .git");
         let uri = format!("file://{}", dir.path().display());
         (dir, uri)
     }
@@ -434,6 +450,28 @@ mod tests {
         assert_eq!(json["total_count"], 1);
         assert_eq!(json["resources"][0]["name"], "proj");
         assert_eq!(json["resources"][0]["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn add_resource_rejects_root_without_git() {
+        let app = test_router().await;
+        // Deliberately not using temp_resource_uri(): that helper seeds a
+        // .git marker, and this test is exactly about a root that lacks one
+        // (e.g. someone pointing a resource at their whole home directory).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = format!("file://{}", dir.path().display());
+
+        let response = app
+            .oneshot(post_resources("proj", &uri))
+            .await
+            .expect("post");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = body_json(response).await;
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains(".git"),
+            "error should explain the missing .git: {body:?}"
+        );
     }
 
     #[tokio::test]

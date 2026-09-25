@@ -50,4 +50,8 @@ pub enum RagdError {
     /// A resource with the requested name already exists.
     #[error("resource already exists: {0}")]
     ResourceAlreadyExists(String),
+
+    /// A resource's root isn't a git repository.
+    #[error("not a git repository: {0}")]
+    NotAGitRepository(String),
 }
