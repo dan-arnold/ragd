@@ -31,10 +31,10 @@
 //! only against the resource-root's own `.gitignore` would miss nested
 //! `.gitignore` files entirely.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -93,6 +93,21 @@ impl ResourceWatcher {
         let task_cancellation = cancellation.clone();
 
         tokio::spawn(async move {
+            let ctx = ReconcileContext {
+                resource_name,
+                root,
+                client,
+                writer,
+                config,
+                cancellation: task_cancellation.clone(),
+            };
+            // Reading a file to reconcile it is itself an `open()`, which
+            // `notify`'s inotify backend reports back as another change
+            // event -- without this, every reconciliation would requeue
+            // itself forever, regardless of whether content ever actually
+            // changes. Keyed by mtime rather than content hash so the
+            // re-trigger is filtered out before the file is even opened.
+            let mut seen_mtimes: HashMap<PathBuf, SystemTime> = HashMap::new();
             loop {
                 tokio::select! {
                     biased;
@@ -100,7 +115,7 @@ impl ResourceWatcher {
                     message = rx.recv() => {
                         let Some(Ok(events)) = message else { continue };
                         let paths: HashSet<PathBuf> = events.into_iter().map(|event| event.path).collect();
-                        reconcile(&resource_name, &root, paths, &client, &writer, &config, &task_cancellation).await;
+                        reconcile(&ctx, paths, &mut seen_mtimes).await;
                     }
                 }
             }
@@ -119,28 +134,36 @@ impl ResourceWatcher {
     }
 }
 
+/// The parts of a watcher's setup that stay fixed across every
+/// reconciliation for its resource -- bundled so `reconcile` doesn't have to
+/// take them as seven separate arguments.
+struct ReconcileContext {
+    resource_name: String,
+    root: PathBuf,
+    client: Arc<OpenAiClient>,
+    writer: ChunkWriter,
+    config: ChunkingConfig,
+    cancellation: CancellationToken,
+}
+
 async fn reconcile(
-    resource_name: &str,
-    root: &Path,
+    ctx: &ReconcileContext,
     paths: HashSet<PathBuf>,
-    client: &Arc<OpenAiClient>,
-    writer: &ChunkWriter,
-    config: &ChunkingConfig,
-    cancellation: &CancellationToken,
+    seen_mtimes: &mut HashMap<PathBuf, SystemTime>,
 ) {
-    if paths.is_empty() || cancellation.is_cancelled() {
+    if paths.is_empty() || ctx.cancellation.is_cancelled() {
         return;
     }
 
-    let ignore_matcher = build_ignore_matcher(root);
+    let ignore_matcher = build_ignore_matcher(&ctx.root);
 
     for path in paths {
-        if cancellation.is_cancelled() {
+        if ctx.cancellation.is_cancelled() {
             return;
         }
 
         let is_dir = path.is_dir();
-        let allowed = path.starts_with(root)
+        let allowed = path.starts_with(&ctx.root)
             && !ignore_matcher
                 .matched_path_or_any_parents(&path, is_dir)
                 .is_ignore();
@@ -161,14 +184,27 @@ async fn reconcile(
         };
 
         if path.is_file() {
+            // `metadata` is a stat, not an open -- checking it doesn't
+            // retrigger the watch the way opening the file to read it
+            // would.
+            if let Ok(modified) = tokio::fs::metadata(&path)
+                .await
+                .and_then(|meta| meta.modified())
+            {
+                if seen_mtimes.get(&path) == Some(&modified) {
+                    continue;
+                }
+                seen_mtimes.insert(path.clone(), modified);
+            }
+
             index_one_file(
-                resource_name,
+                &ctx.resource_name,
                 &path,
                 &extension,
-                client,
-                writer,
-                config,
-                cancellation,
+                &ctx.client,
+                &ctx.writer,
+                &ctx.config,
+                &ctx.cancellation,
             )
             .await;
         } else {
@@ -176,8 +212,10 @@ async fn reconcile(
             // whatever chunks it had. Passing an empty chunk set deletes
             // everything currently recorded for this exact path in one
             // transaction.
-            let _ = writer
-                .replace_file_chunks(resource_name, &path.to_string_lossy(), Vec::new())
+            seen_mtimes.remove(&path);
+            let _ = ctx
+                .writer
+                .replace_file_chunks(&ctx.resource_name, &path.to_string_lossy(), Vec::new())
                 .await;
         }
     }
@@ -238,6 +276,30 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
         format!("http://{addr}")
+    }
+
+    async fn counting_mock_embed_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let route_count = Arc::clone(&count);
+        let app = Router::new().route(
+            "/embeddings",
+            post(move || {
+                let count = Arc::clone(&route_count);
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let embedding = vec![1.0_f32; EMBED_DIM];
+                    Json(serde_json::json!({ "data": [{ "embedding": embedding }] }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (format!("http://{addr}"), count)
     }
 
     async fn poll_until<F, Fut>(timeout: Duration, mut check: F) -> bool
@@ -457,6 +519,49 @@ mod tests {
         assert!(results.is_empty());
 
         setup.watcher.stop();
+    }
+
+    #[tokio::test]
+    async fn reconcile_does_not_reembed_same_file_when_mtime_unchanged() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            Database::connect(data_dir.keep().as_path(), EMBED_DIM)
+                .await
+                .expect("connect"),
+        );
+        let (embed_base, embed_calls) = counting_mock_embed_server().await;
+        let client = Arc::new(
+            OpenAiClient::new(&embed_base, "", "test-embed", &embed_base, "", "test-llm")
+                .expect("client"),
+        );
+        let writer = ChunkWriter::spawn(Arc::clone(&db));
+        let ctx = ReconcileContext {
+            resource_name: "proj".to_string(),
+            root: project.path().to_path_buf(),
+            client,
+            writer,
+            config: ChunkingConfig::default(),
+            cancellation: CancellationToken::new(),
+        };
+
+        let file_path = project.path().join("a.rs");
+        std::fs::write(&file_path, "fn a() {}\n").expect("write a.rs");
+
+        let mut seen_mtimes = HashMap::new();
+        let paths: HashSet<PathBuf> = [file_path.clone()].into_iter().collect();
+
+        reconcile(&ctx, paths.clone(), &mut seen_mtimes).await;
+        // Same debounced path delivered again with no change in between --
+        // exactly what happens when reading the file to reconcile it
+        // retriggers the watch that queued this reconciliation.
+        reconcile(&ctx, paths, &mut seen_mtimes).await;
+
+        assert_eq!(
+            embed_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unchanged file must not be re-read and re-embedded on the second reconcile"
+        );
     }
 
     #[tokio::test]
