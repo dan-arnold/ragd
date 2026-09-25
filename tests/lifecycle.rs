@@ -88,6 +88,7 @@ async fn body_json(response: axum::response::Response) -> serde_json::Value {
 #[tokio::test]
 async fn full_lifecycle_add_index_query_remove() {
     let project = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(project.path().join(".git")).expect("mkdir .git");
     std::fs::write(
         project.path().join("lib.rs"),
         "fn add(a: i32, b: i32) -> i32 { a + b }\n",
